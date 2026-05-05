@@ -2,8 +2,13 @@
 
 import os
 import sys
+import json
 import shutil
 import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+import base64
 import yt_dlp
 
 try:
@@ -13,10 +18,21 @@ except ImportError:
     print("Please install it using: pip install mutagen")
     sys.exit(1)
 
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
+CREDS_PATH = os.path.expanduser("~/.config/mloader/spotdl_creds.json")
+DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")
+DISK_WARN_THRESHOLD_GB = 1.0  # Warn the user if free disk space drops below this
+
+
+# ─────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────
 def main():
     print_intro()
     check_dependencies()
-    
+
     while True:
         print("\n1. Spotify")
         print("2. YouTube")
@@ -25,12 +41,19 @@ def main():
         print("5. Bandcamp")
         print("6. Mixcloud")
         print("7. Other (paste any link)")
+        print("8. Reset Spotify credentials")
         print("0. Exit")
-        
-        choice = input("\nSelect a source (0-7): ").strip()
+
+        choice = input("\nSelect a source (0-8): ").strip()
+
         if choice == '0':
             print("Goodbye!")
             break
+
+        if choice == '8':
+            reset_spotdl_creds()
+            continue
+
         if choice not in [str(i) for i in range(1, 8)]:
             print("❌ Invalid choice. Please try again.")
             continue
@@ -39,15 +62,14 @@ def main():
         if not url:
             print("❌ Error: Link cannot be empty.")
             continue
-            
-        out_prompt = input("Output path (press Enter for ~/Music/mloader): ").strip()
-        if not out_prompt:
-            output_path = os.path.expanduser("~/Music/mloader")
-        else:
-            output_path = os.path.expanduser(out_prompt)
-            
+
+        out_prompt = input(f"Output path (press Enter for {DEFAULT_OUTPUT}): ").strip()
+        output_path = os.path.expanduser(out_prompt) if out_prompt else DEFAULT_OUTPUT
         os.makedirs(output_path, exist_ok=True)
-        
+
+        # Warn early if disk is getting low — better than crashing mid-playlist
+        check_disk_space(output_path)
+
         rename_choice = input("Rename files to 'Song Name - Artist' after download? (y/n): ").strip().lower()
         should_rename = rename_choice == 'y'
 
@@ -58,101 +80,173 @@ def main():
             continue
 
         print(f"\n🚀 Starting download to {output_path}...")
-        
+
         try:
             download_errors = []
-            
+
             if choice == '1':
-                download_errors = download_spotdl(url, output_path)
+                creds = get_spotdl_creds()
+                download_errors = download_spotdl(url, output_path, creds)
             elif choice == '4':
                 download_errors = download_scdl(url, output_path)
             else:
                 download_errors = download_ytdlp(url, output_path)
-                
+
             files_after = get_all_mp3s(output_path)
             new_files = list(files_after - files_before)
-            
+
+            failed_renames = []
             if should_rename and new_files:
-                print("🔄 Renaming downloaded files...")
-                final_files = rename_files(new_files)
+                print("🔄 Standardizing file names...")
+                final_files, failed_renames = rename_files(new_files)
             else:
                 final_files = new_files
-            
-            print("\n" + "-"*40)
+
+            # ── Summary ──
+            print("\n" + "-" * 40)
             print("✅ Download Summary")
-            print("-"*40)
-            print(f"Output Path: {output_path}")
-            print(f"Files downloaded successfully: {len(final_files)}")
-            
+            print("-" * 40)
+            print(f"Output Path   : {output_path}")
+            print(f"Files saved   : {len(final_files)}")
+
             for f in final_files:
                 print(f"  -> {os.path.basename(f)}")
-            
+
+            if failed_renames:
+                print("\n⚠️  Could not rename (missing ID3 tags):")
+                for f in failed_renames:
+                    print(f"  -> {os.path.basename(f)}")
+
             if download_errors:
-                print("\n⚠️ The following errors were encountered:")
+                print("\n⚠️  Errors during download:")
                 for err in download_errors:
-                    clean_err = err.replace("ERROR: ", "").strip()
-                    print(f"  ❌ {clean_err}")
-                    
+                    print(f"  ❌ {err.replace('ERROR: ', '').strip()}")
+
         except Exception as e:
-            print(f"\n❌ A critical error occurred during the process:")
-            print(str(e))
-            
+            print(f"\n❌ A critical error occurred: {e}")
+
         input("\nPress Enter to return to the main menu...")
 
+
+# ─────────────────────────────────────────────
+# SETUP & CHECKS
+# ─────────────────────────────────────────────
 def print_intro():
-    """Prints a brief description of what the tool does."""
-    print("\n" + "="*55)
-    print("🎵 mloader - Unified Media Downloader 🎵")
-    print("="*55)
-    print("A unified CLI tool to download music from multiple")
-    print("platforms (Spotify, YouTube, SoundCloud, Bandcamp)")
-    print("from a single menu. Converts all downloads to MP3")
-    print("and automatically tags/renames them to the format:")
-    print("'Song Name - Artist.mp3'.")
-    print("="*55)
+    print("\n" + "=" * 55)
+    print("🎵  mloader - Unified Media Downloader 🎵")
+    print("=" * 55)
+    print("Downloads from Spotify, YouTube, SoundCloud,")
+    print("Bandcamp, and Mixcloud. Converts everything to")
+    print("MP3 and renames to 'Song Name - Artist.mp3'.")
+    print("=" * 55)
+
 
 def check_dependencies():
-    """
-    Ensure required tools are installed and in the system PATH.
-    """
+    """Check all required CLI tools are installed before doing anything."""
+    tools = {
+        "ffmpeg":  "brew install ffmpeg  /  winget install ffmpeg  /  sudo apt install ffmpeg",
+        "spotdl":  "pip install spotdl",
+        "scdl":    "pip install scdl",
+        "yt-dlp":  "pip install yt-dlp",
+    }
     missing = False
-    
-    if not shutil.which("ffmpeg"):
-        missing = True
-        print("\n❌ Error: ffmpeg is not installed or not found in PATH.")
-        print("  Windows: winget install ffmpeg")
-        print("  macOS:   brew install ffmpeg")
-        print("  Linux:   sudo apt install ffmpeg")
-        
-    if not shutil.which("spotdl"):
-        missing = True
-        print("\n❌ Error: spotdl is not installed or not found in PATH.")
-        print("  Install: pip install spotdl")
-
-    if not shutil.which("scdl"):
-        missing = True
-        print("\n❌ Error: scdl is not installed or not found in PATH.")
-        print("  Install: pip install scdl")
-        
-    if not shutil.which("yt-dlp"):
-        missing = True
-        print("\n❌ Error: yt-dlp is not installed or not found in PATH.")
-        print("  Install: pip install yt-dlp")
-
+    for tool, install_hint in tools.items():
+        if not shutil.which(tool):
+            missing = True
+            print(f"\n❌ {tool} not found in PATH.")
+            print(f"   Install: {install_hint}")
     if missing:
         sys.exit(1)
 
-def get_all_mp3s(directory):
-    """Recursively scans the directory and returns absolute paths to all .mp3 files."""
-    mp3_files = set()
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith(".mp3"):
-                mp3_files.add(os.path.abspath(os.path.join(root, file)))
-    return mp3_files
 
+def check_disk_space(path):
+    """Warn the user if free disk space on the output drive is below the threshold."""
+    try:
+        usage = shutil.disk_usage(path)
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < DISK_WARN_THRESHOLD_GB:
+            print(f"\n⚠️  Warning: Only {free_gb:.1f}GB free on disk. Large downloads may fail.")
+    except Exception:
+        pass  # Non-critical — don't block the download if this check itself fails
+
+
+# ─────────────────────────────────────────────
+# SPOTIFY CREDENTIALS
+# ─────────────────────────────────────────────
+def validate_spotify_creds(client_id, client_secret):
+    """
+    Hit Spotify's token endpoint with a client_credentials grant to confirm
+    the credentials work before saving them. Returns True if valid.
+    Uses only stdlib (urllib) — no extra dependencies.
+    """
+    token_url = "https://accounts.spotify.com/api/token"
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+    req = urllib.request.Request(
+        token_url,
+        data=data,
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return False
+
+
+def get_spotdl_creds():
+    """Load saved Spotify Developer credentials, or prompt and validate on first run."""
+    os.makedirs(os.path.dirname(CREDS_PATH), exist_ok=True)
+
+    if os.path.exists(CREDS_PATH):
+        with open(CREDS_PATH, "r") as f:
+            return json.load(f)
+
+    print("\n--- Spotify API Setup (First Run) ---")
+    print("Register a free app at: https://developer.spotify.com/dashboard")
+    print("Set any Redirect URI (e.g. http://localhost:8080) when prompted there.\n")
+
+    while True:
+        client_id = input("Client ID     : ").strip()
+        client_secret = input("Client Secret : ").strip()
+
+        if not client_id or not client_secret:
+            print("❌ Both fields are required. Try again.")
+            continue
+
+        print("⏳ Validating credentials with Spotify...")
+        if validate_spotify_creds(client_id, client_secret):
+            break
+        else:
+            print("❌ Credentials rejected by Spotify. Double-check your Client ID and Secret and try again.")
+
+    creds = {"client_id": client_id, "client_secret": client_secret}
+    with open(CREDS_PATH, "w") as f:
+        json.dump(creds, f, indent=2)
+
+    print(f"✅ Credentials validated and saved to {CREDS_PATH}")
+    return creds
+
+
+def reset_spotdl_creds():
+    """Delete saved Spotify credentials so the user can re-enter them."""
+    if os.path.exists(CREDS_PATH):
+        os.remove(CREDS_PATH)
+        print("✅ Spotify credentials cleared. You will be prompted to re-enter them on the next Spotify download.")
+    else:
+        print("ℹ️  No saved credentials found.")
+
+
+# ─────────────────────────────────────────────
+# DOWNLOADERS
+# ─────────────────────────────────────────────
 class YTDLPLogger:
-    """Custom logger for yt-dlp to track specific track errors."""
+    """Captures yt-dlp errors per-track without crashing the whole run."""
     def __init__(self):
         self.errors = []
     def debug(self, msg): pass
@@ -160,97 +254,121 @@ class YTDLPLogger:
     def error(self, msg):
         self.errors.append(msg)
 
+
 def download_ytdlp(url, output_path):
-    """Download media using the yt-dlp Python API."""
+    """Download via yt-dlp Python API. Handles YouTube, Bandcamp, Mixcloud, and any other yt-dlp-supported URL."""
     logger = YTDLPLogger()
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
-        'ignoreerrors': True,
+        'ignoreerrors': True,   # Skip failed tracks in playlists instead of aborting
         'logger': logger,
         'postprocessors': [
             {
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '0',
+                'preferredquality': '0',  # Best available — does not upscale compressed audio
             },
             {'key': 'FFmpegMetadata'},
             {'key': 'EmbedThumbnail'},
         ],
         'writethumbnail': True,
-        'quiet': False
+        'quiet': False,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     return logger.errors
 
-def download_spotdl(url, output_path):
+
+def download_spotdl(url, output_path, creds):
     """
-    Download Spotify media using spotdl via subprocess.
-    SpotDL matches Spotify metadata to YouTube audio automatically.
+    Download Spotify tracks via spotdl using your own Developer API credentials.
+    spotdl matches Spotify metadata to YouTube/YouTube Music audio (max 256kbps).
+    Output is named by spotdl's own template so rename_files can standardise it afterward.
     """
     cmd = [
-        "spotdl",
-        "download",
-        url,
+        "spotdl", "download", url,
         "--format", "mp3",
-        "--output", output_path
+        "--output", output_path,
+        "--client-id", creds["client_id"],
+        "--client-secret", creds["client_secret"],
     ]
-    
     result = subprocess.run(cmd, check=False)
-    
     if result.returncode != 0:
-        return ["SpotDL encountered an error with one or more tracks."]
+        return ["SpotDL encountered an error. Check the console output above for details."]
     return []
 
+
 def download_scdl(url, output_path):
-    """Download SoundCloud media using scdl via subprocess."""
+    """Download SoundCloud tracks via scdl. --onlymp3 enforces mp3 output regardless of source format."""
     cmd = [
         "scdl",
         "-l", url,
         "--path", output_path,
-        "--onlymp3"
+        "--onlymp3",
     ]
     result = subprocess.run(cmd, check=False)
-    
     if result.returncode != 0:
-        return ["SoundCloud downloader (scdl) encountered an error."]
+        return ["scdl encountered an error. Check the console output above for details."]
     return []
+
+
+# ─────────────────────────────────────────────
+# FILE UTILITIES
+# ─────────────────────────────────────────────
+def get_all_mp3s(directory):
+    """Recursively returns absolute paths of all .mp3 files under directory."""
+    mp3_files = set()
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".mp3"):
+                mp3_files.add(os.path.abspath(os.path.join(root, file)))
+    return mp3_files
+
 
 def rename_files(new_filepaths):
     """
-    Reads MP3 ID3 tags and renames files to 'Song Name - Artist.mp3'.
+    Reads ID3 tags and renames each file to 'Song Name - Artist.mp3'.
+    Returns (successfully_handled, failed_due_to_missing_tags).
+    Files that can't be renamed are kept under their original name and reported separately.
     """
-    renamed_files = []
+    renamed = []
+    failed = []
+
     for filepath in new_filepaths:
         try:
             audio = EasyID3(filepath)
             title = audio.get('title', [None])[0]
             artist = audio.get('artist', [None])[0]
-            
+
             if title and artist:
+                # Strip characters that are illegal in filenames across macOS/Windows/Linux
                 safe_title = "".join(c for c in title if c not in r'\/:*?"<>|')
                 safe_artist = "".join(c for c in artist if c not in r'\/:*?"<>|')
-                
                 new_filename = f"{safe_title} - {safe_artist}.mp3"
-                dir_name = os.path.dirname(filepath)
-                new_filepath = os.path.join(dir_name, new_filename)
-                
+                new_filepath = os.path.join(os.path.dirname(filepath), new_filename)
+
                 if not os.path.exists(new_filepath):
                     os.rename(filepath, new_filepath)
-                    renamed_files.append(new_filepath)
+                    renamed.append(new_filepath)
                 else:
-                    renamed_files.append(filepath) 
+                    renamed.append(filepath)  # Collision — keep original, still counts as downloaded
             else:
-                renamed_files.append(filepath) 
+                renamed.append(filepath)
+                failed.append(filepath)
         except Exception:
-            renamed_files.append(filepath)
-            
-    return renamed_files
+            renamed.append(filepath)
+            failed.append(filepath)
 
+    return renamed, failed
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nProcess interrupted by user. Exiting mloader...")
+        print("\n\nInterrupted. Exiting mloader...")
         sys.exit(0)
