@@ -22,6 +22,8 @@ except ImportError:
 # CONSTANTS
 # ─────────────────────────────────────────────
 CREDS_PATH = os.path.expanduser("~/.config/mloader/spotdl_creds.json")
+# ── DEFAULT DOWNLOAD PATH ── change this line to set where downloads go by default.
+# Accepts ~ for your home folder, or an absolute path like "/Users/you/Music".
 DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")
 DISK_WARN_THRESHOLD_GB = 1.0  # Warn the user if free disk space drops below this
 
@@ -67,7 +69,7 @@ def main():
         output_path = os.path.expanduser(out_prompt) if out_prompt else DEFAULT_OUTPUT
         os.makedirs(output_path, exist_ok=True)
 
-        # Warn early if disk is getting low — better than crashing mid-playlist
+        # Warn early if disk is getting low - better than crashing mid-playlist
         check_disk_space(output_path)
 
         rename_choice = input("Rename files to 'Song Name - Artist' after download? (y/n): ").strip().lower()
@@ -167,7 +169,7 @@ def check_disk_space(path):
         if free_gb < DISK_WARN_THRESHOLD_GB:
             print(f"\n⚠️  Warning: Only {free_gb:.1f}GB free on disk. Large downloads may fail.")
     except Exception:
-        pass  # Non-critical — don't block the download if this check itself fails
+        pass  # Non-critical - don't block the download if this check itself fails
 
 
 # ─────────────────────────────────────────────
@@ -177,7 +179,7 @@ def validate_spotify_creds(client_id, client_secret):
     """
     Hit Spotify's token endpoint with a client_credentials grant to confirm
     the credentials work before saving them. Returns True if valid.
-    Uses only stdlib (urllib) — no extra dependencies.
+    Uses only stdlib (urllib) - no extra dependencies.
     """
     token_url = "https://accounts.spotify.com/api/token"
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
@@ -267,7 +269,7 @@ def download_ytdlp(url, output_path):
             {
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '0',  # Best available — does not upscale compressed audio
+                'preferredquality': '0',  # Best available - does not upscale compressed audio
             },
             {'key': 'FFmpegMetadata'},
             {'key': 'EmbedThumbnail'},
@@ -283,20 +285,51 @@ def download_ytdlp(url, output_path):
 def download_spotdl(url, output_path, creds):
     """
     Download Spotify tracks via spotdl using your own Developer API credentials.
-    spotdl matches Spotify metadata to YouTube/YouTube Music audio (max 256kbps).
+    spotdl matches Spotify metadata to YouTube/YouTube Music audio, then converts to mp3.
     Output is named by spotdl's own template so rename_files can standardise it afterward.
+
+    --no-cache is critical: spotdl otherwise caches the Spotify token at
+    ~/.spotdl/.spotipy and reuses it even when you pass different credentials. A
+    stale cached token from a DIFFERENT (rate-limited) app causes a bogus
+    "rate/request limit, retry after 86400 s" error. Passing --no-cache forces a
+    fresh token from the credentials below every run, so this can't happen.
+
+    youtube-music gives by far the best matches and is tried first. Its only
+    downside is spotdl's pre-flight check that aborts the run with "blocked by
+    YouTube Music" when your IP is intermittently throttled - so we fall back to
+    plain youtube and then piped, neither of which trips that check (though both
+    match less reliably).
     """
-    cmd = [
-        "spotdl", "download", url,
-        "--format", "mp3",
-        "--output", output_path,
-        "--client-id", creds["client_id"],
-        "--client-secret", creds["client_secret"],
+    # ── AUDIO PROVIDER FALLBACK ORDER ── tweak this list to change which sources
+    # spotdl tries (valid: youtube-music, youtube, piped, soundcloud, bandcamp).
+    provider_chain = ["youtube-music", "youtube", "piped"]
+
+    for i, provider in enumerate(provider_chain):
+        cmd = [
+            "spotdl", "download", url,
+            "--format", "mp3",
+            "--output", output_path,
+            "--client-id", creds["client_id"],
+            "--client-secret", creds["client_secret"],
+            "--audio", provider,
+            "--bitrate", "auto",   # keep best source quality, do not re-encode down
+            "--no-cache",          # always mint a fresh token from the creds above (see docstring)
+        ]
+        result = subprocess.run(cmd, check=False)
+        if result.returncode == 0:
+            return []
+
+        # Failed - fall through to the next provider if one is available
+        if i < len(provider_chain) - 1:
+            next_provider = provider_chain[i + 1]
+            print(f"\n⚠️  spotdl failed with '{provider}' (likely a temporary YouTube Music "
+                  f"block). Retrying with '{next_provider}'...")
+
+    return [
+        "SpotDL failed with every audio provider. This is usually a temporary YouTube Music "
+        "IP block - wait a few minutes and retry, or connect to a VPN. (Your Spotify "
+        "credentials are fine.)"
     ]
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
-        return ["SpotDL encountered an error. Check the console output above for details."]
-    return []
 
 
 def download_scdl(url, output_path):
@@ -352,7 +385,7 @@ def rename_files(new_filepaths):
                     os.rename(filepath, new_filepath)
                     renamed.append(new_filepath)
                 else:
-                    renamed.append(filepath)  # Collision — keep original, still counts as downloaded
+                    renamed.append(filepath)  # Collision - keep original, still counts as downloaded
             else:
                 renamed.append(filepath)
                 failed.append(filepath)

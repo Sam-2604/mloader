@@ -1,6 +1,6 @@
 # mloader 🎵
 
-A unified command-line tool for downloading audio from Spotify, YouTube, SoundCloud, Bandcamp, and Mixcloud — all from a single interactive menu.
+A unified command-line tool for downloading audio from Spotify, YouTube, SoundCloud, Bandcamp, and Mixcloud, all from a single interactive menu.
 
 Downloads are converted to MP3, tagged with full metadata and album art, and can be auto-renamed to `Song Name - Artist.mp3` for clean imports into Rekordbox, Serato, or any DJ software.
 
@@ -12,12 +12,12 @@ mloader routes URLs to the best available backend engine:
 
 | Source | Engine | Quality |
 |---|---|---|
-| Spotify | [spotdl](https://github.com/spotDL/spotify-downloader) | Up to 256kbps (YouTube-sourced) |
+| Spotify | [spotdl](https://github.com/spotDL/spotify-downloader) | Best available from YouTube source (up to ~256kbps) |
 | YouTube / YouTube Music | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Best available |
 | SoundCloud | [scdl](https://github.com/scdl-org/scdl) | Best available, MP3 enforced |
 | Bandcamp / Mixcloud / Other | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Best available |
 
-> **On Spotify quality:** Spotify's audio is DRM-protected. No open-source tool can pull audio directly from Spotify's servers. spotdl works by reading Spotify track metadata and finding the closest audio match on YouTube/YouTube Music. Quality is capped at 256kbps. If a specific track sounds wrong or mismatched, download it directly using the YouTube option with the correct YouTube URL.
+> **On Spotify quality:** Spotify's audio is DRM-protected. No open-source tool can pull audio directly from Spotify's servers. spotdl works by reading Spotify track metadata and finding the closest audio match on YouTube/YouTube Music. The practical ceiling is around 256kbps (the YouTube Music source). mloader sets the spotdl bitrate to `auto`, so the best available source quality is preserved rather than re-encoded down. If a specific track sounds wrong or mismatched, download it directly using the YouTube option with the correct YouTube URL.
 
 ---
 
@@ -63,9 +63,7 @@ mutagen
 
 ## Spotify Setup
 
-spotdl uses a shared Spotify API key by default. Because thousands of users share that same key, Spotify aggressively rate-limits it — you may see a 24-hour block before downloading anything.
-
-The fix is to register your own free Spotify Developer app. Your credentials get their own rate limit bucket that only you consume.
+Spotify downloads require your own free Spotify Developer credentials. spotdl uses these to read track metadata (title, artist, album) from Spotify's API. The actual audio is sourced from YouTube, so Spotify only ever sees metadata reads, never a download.
 
 **Steps:**
 
@@ -77,6 +75,8 @@ The fix is to register your own free Spotify Developer app. Your credentials get
 On the first Spotify download, mloader will ask for these. It validates them against Spotify's API before saving, so you will know immediately if something was mistyped. Credentials are saved to `~/.config/mloader/spotdl_creds.json` and reused automatically on every subsequent run.
 
 To re-enter credentials at any time, select **option 8** from the main menu.
+
+> **Note on credentials and rate limits:** Each Spotify Developer app has its own rate-limit budget. A development-mode app can occasionally get throttled (Spotify returns a `Retry-After` of up to 86400 seconds). If that happens, you can either wait it out or create a second app and switch to it via option 8. mloader passes `--no-cache` to spotdl on every run so it always authenticates with the exact credentials you provided (see Troubleshooting for why this matters).
 
 ---
 
@@ -101,17 +101,33 @@ python mloader.py
 ```
 
 1. Select a source
-2. Paste the URL — track, album, and playlist links all work
+2. Paste the URL. Track, album, and playlist links all work
 3. Set an output path, or press Enter for the default (`~/Music/mloader`)
 4. Choose whether to auto-rename files to `Song Name - Artist.mp3`
 
 mloader downloads, converts, tags, and optionally renames. A summary prints at the end showing every file saved and any errors encountered.
 
+> **Changing the default download folder:** The default is `~/Music/mloader`. To change it permanently, edit the `DEFAULT_OUTPUT` line near the top of `mloader.py`. It accepts `~` for your home folder or any absolute path.
+
+---
+
+## How Spotify Downloads Pick a Source (audio providers)
+
+spotdl can fetch the matched audio from several providers. mloader tries them in order and falls back automatically if one fails:
+
+1. **youtube-music** - tried first. By far the most accurate matches and the most reliable downloads.
+2. **youtube** - fallback. Plain YouTube search; matches less reliably.
+3. **piped** - last resort. Public proxy instances, often unavailable.
+
+The fallback order lives in the `provider_chain` list inside `download_spotdl()` in `mloader.py`. Reorder or trim it if you want different behaviour.
+
+If you ever see `You are blocked by YouTube Music`, that is YouTube throttling your IP address. It is intermittent and clears on its own. See Troubleshooting for the quick fix.
+
 ---
 
 ## Output
 
-All files are saved as MP3 with embedded ID3 tags — title, artist, album, and album art. The optional rename step reads these tags and standardises filenames to:
+All files are saved as MP3 with embedded ID3 tags: title, artist, album, and album art. The optional rename step reads these tags and standardises filenames to:
 
 ```
 Song Name - Artist.mp3
@@ -124,39 +140,48 @@ Files where ID3 tags are missing or malformed are kept under their original down
 ## Known Limitations
 
 **Spotify**
-- Audio quality is capped at 256kbps — this is a platform constraint, not a tool limitation
-- spotdl may occasionally match the wrong YouTube video for tracks with common names, live versions, or remixes — if a track sounds wrong, grab it directly via the YouTube option with the correct YouTube URL
-- Regional or non-Latin-titled tracks (Hindi, Tamil, etc.) have lower match accuracy on YouTube — direct YouTube downloads are more reliable for these
+- Audio quality is capped at roughly 256kbps. This is a platform constraint (YouTube-sourced audio), not a tool limitation
+- spotdl may occasionally match the wrong YouTube video for tracks with common names, live versions, or remixes. If a track sounds wrong, grab it directly via the YouTube option with the correct YouTube URL
+- Regional or non-Latin-titled tracks (Hindi, Tamil, etc.) have lower match accuracy on YouTube. Direct YouTube downloads are more reliable for these
 
 **SoundCloud**
-- Tracks with copyright mutes (silence replacing flagged audio) cannot be recovered — SoundCloud serves the muted version and that is what gets downloaded. Get the clean version from Spotify or YouTube instead
+- Tracks with copyright mutes (silence replacing flagged audio) cannot be recovered. SoundCloud serves the muted version and that is what gets downloaded. Get the clean version from Spotify or YouTube instead
 - Private tracks will silently fail
 
 **YouTube / yt-dlp**
-- YouTube occasionally changes its internal structure and breaks yt-dlp temporarily — if YouTube downloads suddenly stop working, run `pip install -U yt-dlp` first before anything else
-- Age-restricted videos require browser cookies passed to yt-dlp — not currently supported in mloader
+- YouTube occasionally changes its internal structure and breaks yt-dlp temporarily. If YouTube downloads suddenly stop working, run `pip install -U yt-dlp` first before anything else
+- Age-restricted videos require browser cookies passed to yt-dlp, not currently supported in mloader
 
 **General**
-- mloader warns you if free disk space drops below 1GB before starting a download, but does not enforce a hard stop — monitor space manually for very large playlist downloads
+- mloader warns you if free disk space drops below 1GB before starting a download, but does not enforce a hard stop. Monitor space manually for very large playlist downloads
 
 ---
 
 ## Troubleshooting
 
-**Spotify rate limit error (Retry after 86400s)**
-You are hitting the shared spotdl API rate limit. Fix: set up your own Spotify Developer credentials as described in [Spotify Setup](#spotify-setup). Once you have your own Client ID and Secret, this error will not occur.
+**Spotify error: "Your application has reached a rate/request limit. Retry will occur after: 86400 s"**
+This means the Spotify app spotdl authenticated with is rate-limited. Two things to check:
+
+1. **Stale token cache (most common, now handled automatically).** spotdl caches its Spotify token at `~/.spotdl/.spotipy`. If that cache holds a token from a different, rate-limited app, spotdl will keep using it even when you pass fresh credentials, producing this exact error while your real credentials are perfectly fine. mloader now passes `--no-cache` so a fresh token is minted from your credentials every run, preventing this. If you ever hit it manually, delete `~/.spotdl/.spotipy`.
+2. **Genuinely throttled app.** If the app really is over its budget, wait for the limit to reset, or create a second Spotify Developer app and switch to it with option 8.
+
+**Error: "You are blocked by YouTube Music"**
+YouTube Music is throttling your IP address. This is intermittent and not related to your Spotify credentials. Fixes, in order of speed:
+- Switch network to change your IP (mobile data / hotspot, or a VPN). The block is IP-based, so a new IP clears it instantly.
+- Wait a few minutes and retry. It clears on its own.
+- mloader will also automatically fall back from youtube-music to youtube, though plain youtube matches less reliably.
 
 **Credentials rejected during setup**
 Double-check that you copied both values correctly from the Spotify Developer Dashboard and that the app is not in a suspended state. Select option 8 from the menu to reset and re-enter.
 
 **ffmpeg not found**
-Install ffmpeg system-wide and confirm it is in your PATH with `ffmpeg -version`. mloader exits on launch if ffmpeg is missing since all three engines depend on it.
+Install ffmpeg system-wide and confirm it is in your PATH with `ffmpeg -version`. mloader exits on launch if ffmpeg is missing since all engines depend on it.
 
 **yt-dlp fails on YouTube**
-Run `pip install -U yt-dlp`. YouTube structure changes break yt-dlp periodically — updating the package is almost always the fix.
+Run `pip install -U yt-dlp`. YouTube structure changes break yt-dlp periodically and updating the package is almost always the fix.
 
 **Download summary shows 0 files**
-Check the output directory manually. This can happen if ffmpeg failed to convert the file mid-process — the raw audio file may be present without the `.mp3` extension.
+Check the output directory manually. This can happen if ffmpeg failed to convert the file mid-process. The raw audio file may be present without the `.mp3` extension.
 
 **Rename step shows files as failed**
 The file downloaded successfully but has no ID3 tags embedded, so mloader cannot read a title or artist to rename from. This is common with some SoundCloud uploads. The file is still saved under its original downloaded filename.
