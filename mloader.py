@@ -282,31 +282,50 @@ def download_ytdlp(url, output_path):
     return logger.errors
 
 
+# spotdl's pre-flight "are we blocked by YouTube Music?" check is unreliable: it
+# searches the single letter "a" and treats an empty result as a block. YouTube
+# Music frequently returns nothing for that query even when real song searches work
+# perfectly, producing a false "You are blocked by YouTube Music" error that aborts
+# the whole run. We launch spotdl through this shim, which neutralises that one check
+# (sets it to always pass) and then hands control to spotdl's normal entry point.
+# A genuine block still fails naturally during the real search and triggers fallback.
+SPOTDL_SHIM = (
+    "import spotdl.console.entry_point as ep; "
+    "ep.check_ytmusic_connection = lambda: True; "
+    "ep.console_entry_point()"
+)
+
+
 def download_spotdl(url, output_path, creds):
     """
     Download Spotify tracks via spotdl using your own Developer API credentials.
     spotdl matches Spotify metadata to YouTube/YouTube Music audio, then converts to mp3.
     Output is named by spotdl's own template so rename_files can standardise it afterward.
 
-    --no-cache is critical: spotdl otherwise caches the Spotify token at
-    ~/.spotdl/.spotipy and reuses it even when you pass different credentials. A
-    stale cached token from a DIFFERENT (rate-limited) app causes a bogus
-    "rate/request limit, retry after 86400 s" error. Passing --no-cache forces a
-    fresh token from the credentials below every run, so this can't happen.
+    Two spotdl quirks are worked around here:
 
-    youtube-music gives by far the best matches and is tried first. Its only
-    downside is spotdl's pre-flight check that aborts the run with "blocked by
-    YouTube Music" when your IP is intermittently throttled - so we fall back to
-    plain youtube and then piped, neither of which trips that check (though both
-    match less reliably).
+    1. --no-cache: spotdl otherwise caches the Spotify token at ~/.spotdl/.spotipy and
+       reuses it even when you pass different credentials. A stale token from a DIFFERENT
+       (rate-limited) app produces a bogus "rate/request limit, retry after 86400 s" error.
+       --no-cache forces a fresh token from the credentials below on every run.
+
+    2. SPOTDL_SHIM: spotdl's YouTube Music pre-flight check false-positives as "blocked"
+       (see comment above SPOTDL_SHIM). We run spotdl through the shim so that broken check
+       can't abort an otherwise-working download.
+
+    youtube-music gives by far the best matches and is tried first; plain youtube and piped
+    are weaker fallbacks for the rare case youtube-music genuinely fails.
     """
     # ── AUDIO PROVIDER FALLBACK ORDER ── tweak this list to change which sources
     # spotdl tries (valid: youtube-music, youtube, piped, soundcloud, bandcamp).
     provider_chain = ["youtube-music", "youtube", "piped"]
 
     for i, provider in enumerate(provider_chain):
+        # Launch spotdl via the current Python (which has spotdl installed) using the
+        # shim, instead of the bare "spotdl" binary, so the broken check is bypassed.
         cmd = [
-            "spotdl", "download", url,
+            sys.executable, "-c", SPOTDL_SHIM,
+            "download", url,
             "--format", "mp3",
             "--output", output_path,
             "--client-id", creds["client_id"],
@@ -322,13 +341,12 @@ def download_spotdl(url, output_path, creds):
         # Failed - fall through to the next provider if one is available
         if i < len(provider_chain) - 1:
             next_provider = provider_chain[i + 1]
-            print(f"\n⚠️  spotdl failed with '{provider}' (likely a temporary YouTube Music "
-                  f"block). Retrying with '{next_provider}'...")
+            print(f"\n⚠️  spotdl failed with '{provider}'. Retrying with '{next_provider}'...")
 
     return [
-        "SpotDL failed with every audio provider. This is usually a temporary YouTube Music "
-        "IP block - wait a few minutes and retry, or connect to a VPN. (Your Spotify "
-        "credentials are fine.)"
+        "SpotDL failed with every audio provider. Try again in a moment; if it persists, "
+        "your network may be genuinely blocking YouTube (switch network or use a VPN). "
+        "Your Spotify credentials are fine."
     ]
 
 

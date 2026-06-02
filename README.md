@@ -121,7 +121,7 @@ spotdl can fetch the matched audio from several providers. mloader tries them in
 
 The fallback order lives in the `provider_chain` list inside `download_spotdl()` in `mloader.py`. Reorder or trim it if you want different behaviour.
 
-If you ever see `You are blocked by YouTube Music`, that is YouTube throttling your IP address. It is intermittent and clears on its own. See Troubleshooting for the quick fix.
+> **About "You are blocked by YouTube Music":** spotdl has an unreliable pre-flight check that searches the single letter "a" and treats an empty result as a block. YouTube Music often returns nothing for that query even when real song searches work fine, so the check raises a false "blocked" error and aborts the whole run. mloader launches spotdl through a small shim that neutralises that one check, so this false positive no longer stops your downloads. A genuine network block (rare) still fails during the real search and falls back to the next provider.
 
 ---
 
@@ -166,10 +166,10 @@ This means the Spotify app spotdl authenticated with is rate-limited. Two things
 2. **Genuinely throttled app.** If the app really is over its budget, wait for the limit to reset, or create a second Spotify Developer app and switch to it with option 8.
 
 **Error: "You are blocked by YouTube Music"**
-YouTube Music is throttling your IP address. This is intermittent and not related to your Spotify credentials. Fixes, in order of speed:
-- Switch network to change your IP (mobile data / hotspot, or a VPN). The block is IP-based, so a new IP clears it instantly.
-- Wait a few minutes and retry. It clears on its own.
-- mloader will also automatically fall back from youtube-music to youtube, though plain youtube matches less reliably.
+This is almost always a false positive from spotdl's unreliable pre-flight check (it searches "a" and treats an empty result as a block). mloader already bypasses that check with a shim, so you should rarely see this. If a Spotify download still fails:
+- Try again in a moment. spotdl's search results for some queries are momentarily flaky.
+- If it persists, your network may be genuinely blocking YouTube. Switch network (mobile data / hotspot on the computer itself, or a VPN) or wait a few minutes.
+- mloader also falls back from youtube-music to youtube automatically, though plain youtube matches less reliably.
 
 **Credentials rejected during setup**
 Double-check that you copied both values correctly from the Spotify Developer Dashboard and that the app is not in a suspended state. Select option 8 from the menu to reset and re-enter.

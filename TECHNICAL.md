@@ -171,7 +171,7 @@ DISK_WARN_THRESHOLD_GB = 1.0
 - **Purpose:** Download Spotify tracks by matching them to YouTube/YouTube Music audio via spotdl.
 - **Input:** Spotify URL (track, album, or playlist), output path, credentials dict.
 - **Output:** List of error strings.
-- **How it works:** Calls spotdl as a subprocess, once per audio provider in a fallback chain, with:
+- **How it works:** Runs spotdl once per audio provider in a fallback chain. It does not call the bare `spotdl` binary; it launches the current Python (`sys.executable`) with a small shim (`SPOTDL_SHIM`) that neutralises spotdl's broken YouTube Music pre-flight check (see "YouTube Music pre-flight check" below), then forwards these arguments to spotdl's entry point:
   - `download` - spotdl subcommand for downloading
   - `--format mp3` - enforce MP3 output
   - `--output output_path` - destination folder
@@ -193,6 +193,16 @@ spotdl authenticates to Spotify via spotipy, which by default caches the access 
 The failure mode this produces: a `Your application has reached a rate/request limit. Retry will occur after: 86400 s` error, while your actual credentials are perfectly healthy. The request is going out under the cached token's (rate-limited) app, not yours. spotipy then honours the `Retry-After` header and sleeps, which looks like a hang.
 
 mloader avoids this entirely by passing `--no-cache`, forcing a fresh token from the supplied credentials on every run. If you hit this error outside mloader, delete `~/.spotdl/.spotipy`.
+
+---
+
+### YouTube Music pre-flight check (why the shim exists)
+
+Before downloading, spotdl runs `check_ytmusic_connection()`. That function searches YouTube Music for the single letter `"a"` and, if it gets zero usable results, raises `You are blocked by YouTube Music` and aborts the entire run.
+
+The problem: YouTube Music regularly returns nothing for that bare one-character query even when real song searches work perfectly. In testing, `get_results("a")` returned 0 while `get_results("The Weeknd - Blinding Lights")` returned 4 and the underlying `ytmusicapi` returned 20 results for normal queries. So the check produces a false "blocked" error and stops downloads that would otherwise succeed. Changing IP, network, or using a VPN does not fix it, because it is not actually an IP block.
+
+`mloader.py` defines `SPOTDL_SHIM`, a one-line Python snippet that sets `check_ytmusic_connection` to always return `True`, then calls spotdl's normal entry point. `download_spotdl` runs spotdl through this shim (via `sys.executable -c`) instead of the bare binary, so the false check can no longer abort a working download. A genuine block still fails naturally during the real search and triggers the provider fallback.
 
 ---
 
@@ -294,7 +304,7 @@ The guiding principle throughout: **never crash silently**. Every failure either
 ## Known Limitations
 
 - **spotdl match accuracy** - spotdl searches YouTube for the Spotify track's metadata (title + artist). For regional/non-Latin tracks, live versions, or tracks with very common names, the YouTube match may be incorrect. No programmatic way to detect or fix this - requires manual verification.
-- **YouTube Music IP blocks** - spotdl runs a pre-flight check that aborts the run with "You are blocked by YouTube Music" when YouTube is throttling your IP. This is intermittent and IP-based. mloader falls back to the youtube and piped providers, but those match less reliably. The fastest fix is to change your IP (mobile data, hotspot, or VPN) or wait a few minutes.
+- **YouTube Music pre-flight check** - spotdl's "are we blocked by YouTube Music?" check is unreliable and false-positives frequently (see "YouTube Music pre-flight check" above). mloader bypasses it with `SPOTDL_SHIM`. A genuinely throttled network can still fail during the real search; the youtube and piped fallbacks match less reliably, so the practical fix in that rarer case is to change network or wait a few minutes.
 - **spotdl playlist resilience** - unlike yt-dlp which has `ignoreerrors: True`, spotdl does not have a native per-track error skip flag. A single failed track in a large playlist may cause spotdl to exit with a non-zero return code even if the other tracks downloaded successfully. The files are still saved - only the error reporting is imprecise.
 - **SoundCloud muted tracks** - copyright-muted sections on SoundCloud are replaced with silence at the server level before download. mloader receives and saves the muted version. Unrecoverable from SoundCloud.
 - **No download resume** - if a large playlist download is interrupted (network drop, sleep, Ctrl+C), there is no resume state. yt-dlp will skip already-existing files on a re-run (it checks filenames). spotdl has its own archive/cache mechanisms for this but they are not explicitly managed by mloader.
