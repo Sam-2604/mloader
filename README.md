@@ -46,7 +46,7 @@ ffmpeg -version
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/mloader.git
+git clone https://github.com/Sam-2604/mloader.git
 cd mloader
 pip install -r requirements.txt
 ```
@@ -284,3 +284,7 @@ The file downloaded successfully but has no ID3 tags embedded, so mloader cannot
 ## License
 
 MIT
+
+---
+
+<em>Built by Samarth Goradia</em>

@@ -406,3 +406,6 @@ The guiding principle throughout: **never crash silently**. Every failure either
 | `os`, `sys` | stdlib | File paths, directory creation, exit handling |
 
 No new pip packages were introduced by the sync/dedup/Rekordbox features - they use only the standard library.
+
+---
+<em>Author: Samarth Goradia</em>
