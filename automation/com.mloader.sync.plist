@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mloader.sync</string>
+
+    <!-- Replace BOTH paths below with the absolute paths on your machine.
+         See automation/README.md for how to find them. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/mloader/.venv/bin/python3</string>
+        <string>/ABSOLUTE/PATH/TO/mloader/mloader.py</string>
+        <string>--sync</string>
+    </array>
+
+    <!-- launchd starts with a bare PATH that does NOT include Homebrew or your venv,
+         so mloader could not find ffmpeg/scdl/etc. This restores a usable PATH.
+         Replace the first entry with the .venv/bin folder from your machine. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/ABSOLUTE/PATH/TO/mloader/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Every Friday at 02:00. Weekday: 0/7 = Sunday, 1 = Monday ... 5 = Friday. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>5</integer>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Output of each run is logged here so you can check what happened. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/mloader-sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mloader-sync.err</string>
+
+    <!-- Do not run immediately when loaded; only on the schedule above. -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

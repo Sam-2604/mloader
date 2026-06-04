@@ -13,6 +13,16 @@ FEEDBACK.md
 # spotipy token cache (contains live Spotify access tokens - never commit)
 .cache
 
+# mloader runtime/user data - credentials and library state must never be committed.
+# These normally live under ~/.config/mloader and ~/Music/mloader (outside the repo),
+# but these patterns guard against them ever landing inside it.
+spotdl_creds.json
+playlists.json
+*.spotdl
+.archive.txt
+.sync_archive
+rekordbox.xml
+
 # Claude Code local files
 .claude/
 

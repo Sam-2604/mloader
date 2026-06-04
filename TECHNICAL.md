@@ -7,13 +7,19 @@ mloader/
 ├── mloader.py          # Single-file program - all logic lives here
 ├── requirements.txt    # Python package dependencies
 ├── README.md           # User-facing setup and usage guide
-└── TECHNICAL.md        # This file
+├── TECHNICAL.md        # This file
+└── automation/
+    ├── com.mloader.sync.plist   # macOS launchd schedule for weekly headless sync
+    └── README.md                # Plain-language install/uninstall guide
 ```
 
-External config written at runtime:
+External config + state written at runtime (all outside the repo):
 ```
 ~/.config/mloader/
-└── spotdl_creds.json   # Spotify Developer API credentials (created on first Spotify download)
+├── spotdl_creds.json   # Spotify Developer API credentials (first Spotify download)
+├── playlists.json      # Saved-playlist registry for syncing
+└── sync/
+    └── <slug>.spotdl   # spotdl per-playlist tracking file (Spotify only)
 ```
 
 spotdl also keeps its own config and token cache (created/managed by spotdl, not mloader):
@@ -23,10 +29,22 @@ spotdl also keeps its own config and token cache (created/managed by spotdl, not
 └── .spotipy            # cached Spotify access token (mloader bypasses this with --no-cache)
 ```
 
-Default download output (user-configurable per run):
+Managed library root (synced playlists + generated XML):
 ```
 ~/Music/mloader/
+├── spotify/<slug>/      soundcloud/<slug>/      youtube/<slug>/
+├── general/             # loose songs
+└── rekordbox.xml        # regenerated on every sync
 ```
+
+---
+
+## Two run modes
+
+mloader has two entry behaviours, selected by `argparse` in the `__main__` block:
+
+- **Interactive (default):** `python mloader.py` runs `main()`, the menu loop.
+- **Headless sync:** `python mloader.py --sync` runs `run_sync()` once and exits - no menu, no prompts. This is what the weekly `launchd` automation calls.
 
 ---
 
@@ -35,27 +53,24 @@ Default download output (user-configurable per run):
 mloader is a single-file CLI wrapper. It has no classes for orchestration - all logic is organised into standalone functions grouped by responsibility. The `main()` loop handles user input and orchestrates calls to the downloader functions.
 
 ```
-main()
-  ├── print_intro()              <- banner on launch
-  ├── check_dependencies()       <- verify ffmpeg, spotdl, scdl, yt-dlp are in PATH
-  │
-  └── [loop]
-        ├── input: source choice, url, output path, rename preference
-        ├── check_disk_space()   <- warn if <1GB free before starting
-        ├── get_all_mp3s()       <- snapshot of output dir before download
-        │
-        ├── download_spotdl()    <- if choice == 1 (Spotify)
-        │     └── get_spotdl_creds()
-        │           └── validate_spotify_creds()   <- first run only
-        ├── download_scdl()      <- if choice == 4 (SoundCloud)
-        └── download_ytdlp()     <- all other sources
-        │
-        ├── get_all_mp3s()       <- snapshot after download; diff gives new files
-        ├── rename_files()       <- optional; reads ID3 tags, renames to standard format
-        └── summary block        <- prints results and errors
+main()                              run_sync()  (also via --sync)
+  ├── print_intro()                   ├── check_dependencies()
+  ├── check_dependencies()            ├── load_registry()
+  │                                   ├── for each playlist:
+  └── [loop]                          │     └── sync_one_playlist()
+        ├── 1-7  standalone download  │           ├── spotdl sync   (spotify)
+        │     ├── download_spotdl()   │           ├── scdl --sync   (soundcloud)
+        │     ├── download_scdl()     │           ├── download_ytdlp(archive) (youtube)
+        │     ├── download_ytdlp()    │           └── rename_files() on new files
+        │     ├── rename_files()      └── generate_rekordbox_xml()
+        │     └── handle_duplicate_downloads()
+        ├── 8    add_playlist()
+        ├── 9    list_playlists()
+        ├── 10   run_sync()
+        └── 11   reset_spotdl_creds()
 ```
 
-The program never stores any in-memory state between loop iterations. Each download cycle is independent: inputs collected fresh, snapshots taken fresh, errors reported fresh.
+Standalone downloads carry no in-memory state between iterations. Sync state lives on disk: the registry (`playlists.json`), spotdl's per-playlist `.spotdl` files, scdl's `.sync_archive`, and yt-dlp's `.archive.txt`.
 
 ---
 
@@ -63,11 +78,16 @@ The program never stores any in-memory state between loop iterations. Each downl
 
 ```python
 CREDS_PATH = os.path.expanduser("~/.config/mloader/spotdl_creds.json")
-DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")
+MLOADER_ROOT = os.path.expanduser("~/Music/mloader")          # managed library + XML root
+DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")        # default for standalone downloads
+PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
+SYNC_DIR = os.path.expanduser("~/.config/mloader/sync")       # spotdl .spotdl tracking files
+REKORDBOX_XML = os.path.join(MLOADER_ROOT, "rekordbox.xml")
+SYNC_SOURCES = {"spotify": "spotify", "soundcloud": "soundcloud", "youtube": "youtube"}
 DISK_WARN_THRESHOLD_GB = 1.0
 ```
 
-`os.path.expanduser()` resolves the `~` home directory symbol correctly on macOS, Linux, and Windows. These are defined at the top of the file so they can be changed in one place without hunting through the code. To change the default download folder, edit `DEFAULT_OUTPUT` - it accepts `~` or an absolute path.
+`os.path.expanduser()` resolves the `~` home directory symbol correctly on macOS, Linux, and Windows. These are defined at the top of the file so they can be changed in one place. `MLOADER_ROOT` is the managed library where synced playlists are organised as `<root>/<source>/<slug>/` and where `rekordbox.xml` is written; `DEFAULT_OUTPUT` is only the fallback destination for one-off downloads. They can point to different places.
 
 ---
 
@@ -145,10 +165,11 @@ DISK_WARN_THRESHOLD_GB = 1.0
 
 ---
 
-### `download_ytdlp(url, output_path)`
+### `download_ytdlp(url, output_path, archive_path=None)`
 - **Purpose:** Download audio from YouTube, YouTube Music, Bandcamp, Mixcloud, or any other yt-dlp-supported URL.
-- **Input:** URL string, output directory path string.
+- **Input:** URL string, output directory path string, and an optional `archive_path`.
 - **Output:** List of error strings (empty if everything succeeded).
+- **`archive_path`:** when provided, sets yt-dlp's `download_archive` option. yt-dlp records every successfully downloaded video ID in that file and skips IDs already listed. This is what makes YouTube playlist sync idempotent - re-runs only fetch tracks added since last time. Standalone downloads pass nothing, so this is off by default.
 - **How it works:**
   - Uses yt-dlp's Python API directly (`import yt_dlp`) rather than calling it as a subprocess - this gives more control over error handling
   - `format: bestaudio/best` - selects the highest quality audio-only stream. Falls back to best available if no audio-only stream exists
@@ -233,6 +254,54 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 
 ---
 
+## Playlist Sync Functions
+
+### `slugify(name)`
+- Turns a playlist name into a safe folder slug: lowercase, non-word characters stripped, spaces/underscores collapsed to single hyphens. Falls back to `"playlist"` for an empty result. Used for both folder names and `.spotdl` filenames.
+
+### `load_registry()` / `save_registry(registry)`
+- Read/write the saved-playlist list at `PLAYLISTS_PATH` (`playlists.json`). `load_registry` returns `[]` if the file is missing or unreadable; `save_registry` creates the parent directory and writes indented JSON. Each entry has `name`, `source`, `url`, `output_path`, and `sync_file` (the last is `null` for non-Spotify sources).
+
+### `load_creds_noninteractive()`
+- Returns saved Spotify credentials as a dict, or `None` if the file is missing/unreadable. Unlike `get_spotdl_creds()` it never prompts, so it is safe in headless `--sync` mode. When it returns `None`, Spotify playlists are skipped during sync rather than blocking on input.
+
+### `add_playlist()` (menu option 8)
+- Prompts for name + source (Spotify/SoundCloud/YouTube) + URL, computes the managed folder `MLOADER_ROOT/<source>/<slug>` and (for Spotify) a `SYNC_DIR/<slug>.spotdl` tracking file, then appends the entry to the registry. Refuses to add a duplicate name+source. Creates the output folder so it exists before the first sync.
+
+### `list_playlists()` (menu option 9)
+- Prints every registered playlist with its source, URL, and folder.
+
+### `run_sync()` (menu option 10 and `--sync`)
+- Verifies dependencies, loads the registry, syncs each playlist via `sync_one_playlist()`, then calls `generate_rekordbox_xml()`. No prompts, so it backs both the menu option and the headless flag. Each playlist sync is wrapped in try/except so one failure does not abort the rest.
+
+### `sync_one_playlist(entry, creds)`
+- Runs the source-appropriate native sync, then renames any new files:
+  - **spotify:** `spotdl sync` via `_spotdl_base()` (the shim). First run (no `.spotdl` file yet) downloads everything and writes the tracking file with `--save-file`; later runs sync from the tracking file, which adds new tracks **and deletes tracks removed from the playlist**. Skipped with a message if no credentials are available.
+  - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks.
+  - **youtube:** `download_ytdlp(url, output_path, archive_path=.archive.txt)` so already-fetched videos are skipped (additive only, no deletion).
+- New files are detected with the same before/after `get_all_mp3s` diff used by standalone downloads and passed through `rename_files`.
+
+---
+
+## Duplicate Handling
+
+### `handle_duplicate_downloads(final_files, files_before)`
+- **Standalone only.** Builds a map of basename to existing paths from `files_before`, then for each newly downloaded file whose basename collides with an existing one, prompts: keep both, skip (delete the new copy), or replace (delete the old copy). Returns the surviving file list for the summary. Sync never calls this - its dedup is handled natively per engine and by the Rekordbox export.
+- `_safe_remove(path)` is a small best-effort `os.remove` wrapper used for the skip/replace deletions.
+
+---
+
+## Rekordbox XML Export
+
+### `generate_rekordbox_xml()`
+- Builds `REKORDBOX_XML` (`~/Music/mloader/rekordbox.xml`) from the entire managed library and returns the unique-track count. Uses only `xml.etree.ElementTree` (stdlib).
+- **Collection dedup (the core requirement):** `_build_collection()` walks every mp3 under `MLOADER_ROOT`, reads tags via `_read_tags()`, and keys each track by `(title.lower(), artist.lower())` (`_track_key`). The same song existing as two files in two folders yields **one** `<TRACK>` entry with a single `TrackID`. It returns both the collection and a `file -> key` map.
+- **Playlist tree:** `_dir_to_node()` recursively mirrors the folder structure - a folder with sub-folders becomes a `Type="0"` node, a folder with mp3s becomes a `Type="1"` playlist node, and a folder with both gets sub-folder nodes plus a playlist node for its own tracks. `_playlist_node()` resolves each file to its collection `TrackID` (deduped within the playlist) and emits `<TRACK Key="...">` references. A song in two folders is referenced by the same `TrackID` in both playlist nodes.
+- **Locations:** `_file_uri()` produces `file://localhost/` + a percent-encoded absolute path, per the Rekordbox XML spec.
+- Output is written with `ET.indent()` for readability and a UTF-8 XML declaration, overwriting any previous file.
+
+---
+
 ## Data Flow
 
 ```
@@ -310,6 +379,10 @@ The guiding principle throughout: **never crash silently**. Every failure either
 - **No download resume** - if a large playlist download is interrupted (network drop, sleep, Ctrl+C), there is no resume state. yt-dlp will skip already-existing files on a re-run (it checks filenames). spotdl has its own archive/cache mechanisms for this but they are not explicitly managed by mloader.
 - **Age-restricted YouTube content** - requires browser cookies passed to yt-dlp. Not implemented.
 - **Disk space is a warning, not a hard stop** - mloader warns at 1GB free but does not prevent the download. A very large playlist on a nearly-full disk will fail mid-run.
+- **YouTube sync is additive only** - the yt-dlp download-archive skips already-downloaded tracks but never deletes. Only Spotify (`spotdl sync`) and SoundCloud (`scdl --sync`) remove tracks dropped from a playlist. Removing a track from a YouTube playlist leaves the file on disk.
+- **Rekordbox dedup is tag-based** - the collection is deduplicated by ID3 `title + artist` (case-insensitive). Two files of the same song with inconsistent tags (e.g. "The Weeknd" vs "Weeknd, The") are treated as different tracks and both appear. Clean tags give clean dedup.
+- **launchd needs the Mac awake** - the weekly automation only fires if the Mac is powered on and awake at the scheduled time; missed runs are not caught up. See `automation/README.md`.
+- **Headless sync cannot enter credentials** - `--sync` uses `load_creds_noninteractive()`; if no Spotify credentials are saved, Spotify playlists are skipped (run one Spotify download interactively first).
 
 ---
 
@@ -327,4 +400,9 @@ The guiding principle throughout: **never crash silently**. Every failure either
 | `json` | stdlib | Reading and writing the credentials config file |
 | `shutil` | stdlib | `which()` for dependency checks, `disk_usage()` for space check |
 | `subprocess` | stdlib | Running spotdl and scdl as external CLI processes |
+| `xml.etree.ElementTree` | stdlib | Building the Rekordbox XML collection and playlist tree |
+| `argparse` | stdlib | Parsing the `--sync` headless flag |
+| `re` | stdlib | Slugifying playlist names into folder/file slugs |
 | `os`, `sys` | stdlib | File paths, directory creation, exit handling |
+
+No new pip packages were introduced by the sync/dedup/Rekordbox features - they use only the standard library.
