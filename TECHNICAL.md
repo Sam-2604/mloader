@@ -289,6 +289,7 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
   - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks.
   - **youtube:** `download_ytdlp(url, output_path, archive_path=.archive.txt)` so already-fetched videos are skipped (additive only, no deletion).
 - New files are detected with the same before/after `get_all_mp3s` diff used by standalone downloads and passed through `rename_files`.
+- **Returns notable lines.** For spotdl and scdl the command is run through `_run_and_capture()` (a `subprocess.Popen` tee that echoes output live while capturing it), then `_parse_sync_errors()` extracts lines containing any of `SYNC_ERROR_KEYWORDS` (`error`, `failed`, `skipped`, `not found`, case-insensitive, de-duplicated). For youtube the yt-dlp logger's own error list is returned. `run_sync()` collects these per playlist and prints them in a "Sync notices" summary, the same way standalone yt-dlp errors are surfaced.
 
 ---
 
@@ -369,7 +370,8 @@ The file is created by `get_spotdl_creds()` on first Spotify download and read o
 | Disk space | Warning printed, download proceeds - non-blocking |
 | yt-dlp per-track errors | Captured by `YTDLPLogger`, displayed in summary |
 | spotdl audio provider failure | `check=False`; non-zero exit triggers fallback to the next provider |
-| spotdl / scdl errors | `check=False` on subprocess; non-zero exit caught and reported |
+| spotdl / scdl errors (standalone) | `check=False` on subprocess; non-zero exit caught and reported |
+| spotdl / scdl errors (sync) | output teed and captured by `_run_and_capture`, scanned by `_parse_sync_errors`, listed per playlist in the sync summary |
 | Rename failures | Caught per-file in `try/except`; file kept, path added to `failed` list |
 | Credential validation failure | Loop re-prompts until valid or user force-quits |
 | Critical unexpected errors | Top-level `except Exception as e` in main loop prints error, returns to menu |

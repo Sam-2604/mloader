@@ -551,15 +551,28 @@ def run_sync(entries=None):
 
     creds = load_creds_noninteractive()
     print(f"\n🔄 Syncing {len(entries)} playlist(s)...")
+    sync_issues = {}   # playlist name -> list of notable lines
     for entry in entries:
         try:
-            sync_one_playlist(entry, creds)
+            errs = sync_one_playlist(entry, creds)
+            if errs:
+                sync_issues[entry.get("name")] = errs
         except Exception as e:
+            sync_issues[entry.get("name")] = [f"Critical error: {e}"]
             print(f"❌ Error syncing '{entry.get('name')}': {e}")
 
     print("\n🎛️  Generating Rekordbox XML...")
     count = generate_rekordbox_xml()
     print(f"✅ Rekordbox XML written to {REKORDBOX_XML} ({count} unique tracks).")
+
+    if sync_issues:
+        print("\n" + "-" * 40)
+        print("⚠️  Sync notices (errors / failed / skipped / not found)")
+        print("-" * 40)
+        for pname, errs in sync_issues.items():
+            print(f"\n[{pname}]")
+            for line in errs:
+                print(f"  - {line.replace('ERROR: ', '').strip()}")
 
 
 def sync_specific_playlists():
@@ -629,6 +642,52 @@ def sync_playlists_by_name(names):
     run_sync(entries=selected)
 
 
+# Lines in spotdl/scdl output matching any of these (case-insensitive) are surfaced
+# individually in the sync summary, the same way yt-dlp's captured errors are.
+SYNC_ERROR_KEYWORDS = ("error", "failed", "skipped", "not found")
+
+
+def _run_and_capture(cmd):
+    """
+    Run a command, streaming its combined stdout+stderr to the console live (so the user
+    still sees progress) while also capturing it. Returns the full captured text.
+
+    Uses Popen for tee behaviour rather than subprocess.run(capture_output=True), which
+    would hide all output until the process finished.
+    """
+    captured = []
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merge so the order matches what a user would see
+        text=True,
+        bufsize=1,                  # line-buffered, so the live echo is timely
+    )
+    for line in proc.stdout:
+        print(line, end="")         # tee: echo live
+        captured.append(line)
+    proc.wait()
+    return "".join(captured)
+
+
+def _parse_sync_errors(text):
+    """
+    Pull notable lines out of captured sync output - those containing any of
+    SYNC_ERROR_KEYWORDS (case-insensitive) - so they appear individually in the sync
+    summary. Exact duplicate lines are collapsed to keep the summary readable.
+    """
+    found = []
+    seen = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line in seen:
+            continue
+        if any(k in line.lower() for k in SYNC_ERROR_KEYWORDS):
+            seen.add(line)
+            found.append(line)
+    return found
+
+
 def sync_one_playlist(entry, creds):
     """
     Sync a single registered playlist with its source's native sync mechanism:
@@ -636,6 +695,11 @@ def sync_one_playlist(entry, creds):
       - soundcloud : `scdl --sync` against a per-folder archive
       - youtube    : yt-dlp with a download-archive so existing tracks are skipped
     New files are renamed to the standard 'Song - Artist.mp3' afterward.
+
+    Returns a list of notable lines (errors / failures / skips / not-found) so they show
+    up individually in the sync summary. For spotdl and scdl, output is teed to the
+    console live and captured, then scanned for SYNC_ERROR_KEYWORDS; for youtube the
+    yt-dlp logger's own error list is returned.
     """
     name = entry["name"]
     source = entry["source"]
@@ -645,11 +709,12 @@ def sync_one_playlist(entry, creds):
 
     print(f"\n── {name} [{source}] ──")
     files_before = get_all_mp3s(output_path)
+    errors = []
 
     if source == "spotify":
         if not creds:
             print("  ⏭️  Skipped: no Spotify credentials saved (run a Spotify download once to set them up).")
-            return
+            return []
         sync_file = os.path.expanduser(entry["sync_file"])
         os.makedirs(os.path.dirname(sync_file), exist_ok=True)
         if os.path.exists(sync_file):
@@ -672,7 +737,7 @@ def sync_one_playlist(entry, creds):
                 "--client-secret", creds["client_secret"],
                 "--bitrate", "auto", "--no-cache",
             ]
-        subprocess.run(cmd, check=False)
+        errors = _parse_sync_errors(_run_and_capture(cmd))
 
     elif source == "soundcloud":
         # scdl --sync compares the playlist against an archive db and downloads/removes
@@ -684,22 +749,23 @@ def sync_one_playlist(entry, creds):
             "--path", output_path,
             "--onlymp3",
         ]
-        subprocess.run(cmd, check=False)
+        errors = _parse_sync_errors(_run_and_capture(cmd))
 
     elif source == "youtube":
         # A download-archive makes re-runs skip already-fetched videos.
         archive = os.path.join(output_path, ".archive.txt")
-        download_ytdlp(url, output_path, archive_path=archive)
+        errors = download_ytdlp(url, output_path, archive_path=archive)
 
     else:
         print(f"  ⏭️  Skipped: unknown source '{source}'.")
-        return
+        return [f"Unknown source '{source}'"]
 
     files_after = get_all_mp3s(output_path)
     new_files = list(files_after - files_before)
     if new_files:
         rename_files(new_files)
     print(f"  ✓ {len(new_files)} new track(s).")
+    return errors
 
 
 # ─────────────────────────────────────────────

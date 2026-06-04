@@ -154,6 +154,8 @@ Beyond one-off downloads, mloader can keep playlists in sync: download new track
 
 > Spotify is the only source that deletes removed tracks from disk, because spotdl's sync file tracks the full playlist state. SoundCloud does this too via its archive. YouTube only adds.
 
+Each engine's output is shown live during the sync and also captured, so any notable lines (errors, failures, skips, not-found) are collected and listed per playlist in a "Sync notices" summary at the end - the same way one-off download errors are reported.
+
 **Sync specific playlists (option 11):** when you do not want to sync everything, this lists your saved playlists with a number next to each. Type a comma-separated list (e.g. `1,3,5`) and only those are synced, in the order you typed. The Rekordbox XML is regenerated at the end as usual.
 
 ### Syncing without the menu (headless)
