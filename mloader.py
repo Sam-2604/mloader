@@ -649,40 +649,86 @@ SYNC_ERROR_KEYWORDS = ("error", "failed", "skipped", "not found")
 
 def _run_and_capture(cmd):
     """
-    Run a command, streaming its combined stdout+stderr to the console live (so the user
-    still sees progress) while also capturing it. Returns the full captured text.
+    Run a command attached to a pseudo-terminal (pty) and tee its output: the tool renders
+    its FULL real-time UI to the console - colours, green download indicators, progress
+    bars, and the "retry will occur after Xs" countdowns - exactly as if run directly,
+    while we also capture every byte and return it as text for error parsing.
 
-    Uses Popen for tee behaviour rather than subprocess.run(capture_output=True), which
-    would hide all output until the process finished.
+    Why a pty and not a plain pipe: spotdl and scdl (via rich/curses-style output) detect
+    when stdout is not a terminal and strip colours, drop progress bars, and block-buffer.
+    A pty makes them believe they are on a real terminal, so none of that live feedback is
+    lost. Falls back to a line-streamed pipe only where pty is unavailable (e.g. Windows).
     """
+    try:
+        import pty
+    except ImportError:
+        return _run_and_capture_pipe(cmd)
+
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True,
+        )
+    except Exception:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+    os.close(slave_fd)  # only the child writes to the slave side
+
+    chunks = []
+    try:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break  # EIO is raised when the child closes the pty on exit (expected)
+            if not data:
+                break
+            sys.stdout.buffer.write(data)   # pass raw bytes through: keeps colours and \r
+            sys.stdout.buffer.flush()
+            chunks.append(data)
+    finally:
+        os.close(master_fd)
+        proc.wait()
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _run_and_capture_pipe(cmd):
+    """Fallback tee for platforms without pty: stream lines live while capturing them."""
     captured = []
     proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,   # merge so the order matches what a user would see
-        text=True,
-        bufsize=1,                  # line-buffered, so the live echo is timely
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
     for line in proc.stdout:
-        print(line, end="")         # tee: echo live
+        print(line, end="")
         captured.append(line)
     proc.wait()
     return "".join(captured)
+
+
+# Matches ANSI colour/cursor escape sequences so captured lines are clean in the summary.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def _parse_sync_errors(text):
     """
     Pull notable lines out of captured sync output - those containing any of
     SYNC_ERROR_KEYWORDS (case-insensitive) - so they appear individually in the sync
-    summary. Exact duplicate lines are collapsed to keep the summary readable.
+    summary. ANSI colour codes are stripped and exact duplicates collapsed for a clean
+    summary. Rate-limit retry countdowns ("retry will occur after Xs") are normal progress,
+    not errors, so they are explicitly excluded.
     """
     found = []
     seen = set()
+    # splitlines() also breaks on \r, so progress-bar fragments are handled too.
     for raw in text.splitlines():
-        line = raw.strip()
+        line = _ANSI_RE.sub("", raw).strip()
         if not line or line in seen:
             continue
-        if any(k in line.lower() for k in SYNC_ERROR_KEYWORDS):
+        low = line.lower()
+        if "retry will occur" in low:
+            continue  # spotdl rate-limit countdown - feedback, not an error
+        if any(k in low for k in SYNC_ERROR_KEYWORDS):
             seen.add(line)
             found.append(line)
     return found
