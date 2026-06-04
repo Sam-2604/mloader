@@ -74,9 +74,9 @@ Spotify downloads require your own free Spotify Developer credentials. spotdl us
 
 On the first Spotify download, mloader will ask for these. It validates them against Spotify's API before saving, so you will know immediately if something was mistyped. Credentials are saved to `~/.config/mloader/spotdl_creds.json` and reused automatically on every subsequent run.
 
-To re-enter credentials at any time, select **option 11** from the main menu.
+To re-enter credentials at any time, select **option 12** from the main menu.
 
-> **Note on credentials and rate limits:** Each Spotify Developer app has its own rate-limit budget. A development-mode app can occasionally get throttled (Spotify returns a `Retry-After` of up to 86400 seconds). If that happens, you can either wait it out or create a second app and switch to it via option 11. mloader passes `--no-cache` to spotdl on every run so it always authenticates with the exact credentials you provided (see Troubleshooting for why this matters).
+> **Note on credentials and rate limits:** Each Spotify Developer app has its own rate-limit budget. A development-mode app can occasionally get throttled (Spotify returns a `Retry-After` of up to 86400 seconds). If that happens, you can either wait it out or create a second app and switch to it via option 12. mloader passes `--no-cache` to spotdl on every run so it always authenticates with the exact credentials you provided (see Troubleshooting for why this matters).
 
 ---
 
@@ -102,9 +102,10 @@ python mloader.py
 8. Save a playlist for syncing
 9. List saved playlists
 10. Sync all saved playlists
+11. Sync specific playlists
 
 --- Settings ---
-11. Reset Spotify credentials
+12. Reset Spotify credentials
 0. Exit
 ```
 
@@ -152,6 +153,24 @@ Beyond one-off downloads, mloader can keep playlists in sync: download new track
 | YouTube | yt-dlp with a download-archive - skips already-downloaded tracks (does not delete) |
 
 > Spotify is the only source that deletes removed tracks from disk, because spotdl's sync file tracks the full playlist state. SoundCloud does this too via its archive. YouTube only adds.
+
+**Sync specific playlists (option 11):** when you do not want to sync everything, this lists your saved playlists with a number next to each. Type a comma-separated list (e.g. `1,3,5`) and only those are synced, in the order you typed. The Rekordbox XML is regenerated at the end as usual.
+
+### Syncing without the menu (headless)
+
+All three sync modes have a command-line form, so they can run from a script or scheduler:
+
+```bash
+python mloader.py --sync                              # all saved playlists
+python mloader.py --sync-playlist house-vibes         # one, by registered name
+python mloader.py --sync-playlists english,hindi-party,edm   # several, by name
+```
+
+Names are matched against the saved (slugified) playlist name, so `house-vibes` and `House Vibes` both resolve to the same playlist. For long-running syncs, prefix with `caffeinate -i` on macOS to stop the Mac sleeping mid-run:
+
+```bash
+caffeinate -i python mloader.py --sync-playlist house-vibes
+```
 
 ---
 
@@ -244,7 +263,7 @@ Files where ID3 tags are missing or malformed are kept under their original down
 This means the Spotify app spotdl authenticated with is rate-limited. Two things to check:
 
 1. **Stale token cache (most common, now handled automatically).** spotdl caches its Spotify token at `~/.spotdl/.spotipy`. If that cache holds a token from a different, rate-limited app, spotdl will keep using it even when you pass fresh credentials, producing this exact error while your real credentials are perfectly fine. mloader now passes `--no-cache` so a fresh token is minted from your credentials every run, preventing this. If you ever hit it manually, delete `~/.spotdl/.spotipy`.
-2. **Genuinely throttled app.** If the app really is over its budget, wait for the limit to reset, or create a second Spotify Developer app and switch to it with option 11.
+2. **Genuinely throttled app.** If the app really is over its budget, wait for the limit to reset, or create a second Spotify Developer app and switch to it with option 12.
 
 **Error: "You are blocked by YouTube Music"**
 This is almost always a false positive from spotdl's unreliable pre-flight check (it searches "a" and treats an empty result as a block). mloader already bypasses that check with a shim, so you should rarely see this. If a Spotify download still fails:
@@ -253,7 +272,7 @@ This is almost always a false positive from spotdl's unreliable pre-flight check
 - mloader also falls back from youtube-music to youtube automatically, though plain youtube matches less reliably.
 
 **Credentials rejected during setup**
-Double-check that you copied both values correctly from the Spotify Developer Dashboard and that the app is not in a suspended state. Select option 11 from the menu to reset and re-enter.
+Double-check that you copied both values correctly from the Spotify Developer Dashboard and that the app is not in a suspended state. Select option 12 from the menu to reset and re-enter.
 
 **ffmpeg not found**
 Install ffmpeg system-wide and confirm it is in your PATH with `ffmpeg -version`. mloader exits on launch if ffmpeg is missing since all engines depend on it.

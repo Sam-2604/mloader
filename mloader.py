@@ -69,11 +69,12 @@ def main():
         print("8. Save a playlist for syncing")
         print("9. List saved playlists")
         print("10. Sync all saved playlists")
+        print("11. Sync specific playlists")
         print("\n--- Settings ---")
-        print("11. Reset Spotify credentials")
+        print("12. Reset Spotify credentials")
         print("0. Exit")
 
-        choice = input("\nSelect an option (0-11): ").strip()
+        choice = input("\nSelect an option (0-12): ").strip()
 
         if choice == '0':
             print("Goodbye!")
@@ -89,6 +90,10 @@ def main():
             input("\nPress Enter to return to the main menu...")
             continue
         if choice == '11':
+            sync_specific_playlists()
+            input("\nPress Enter to return to the main menu...")
+            continue
+        if choice == '12':
             reset_spotdl_creds()
             continue
         if choice not in STANDALONE_SOURCES:
@@ -524,11 +529,13 @@ def list_playlists():
 # ─────────────────────────────────────────────
 # SYNC
 # ─────────────────────────────────────────────
-def run_sync():
+def run_sync(entries=None):
     """
-    Sync every registered playlist using its engine's native sync, then regenerate the
-    Rekordbox XML. Has no prompts, so the same function backs both menu option 10 and the
-    headless `--sync` flag used by the weekly automation.
+    Sync registered playlists, then regenerate the Rekordbox XML. Has no prompts, so it
+    backs menu option 10, the headless `--sync` flag, and the selective-sync paths.
+
+    entries: the list of registry entries to sync. When None (the default), every saved
+    playlist is synced - so `run_sync()` with no arguments behaves exactly as before.
     """
     check_dependencies()
     registry = load_registry()
@@ -536,9 +543,15 @@ def run_sync():
         print("No saved playlists to sync. Use 'Save a playlist for syncing' first.")
         return
 
+    if entries is None:
+        entries = registry
+    if not entries:
+        print("No matching playlists to sync.")
+        return
+
     creds = load_creds_noninteractive()
-    print(f"\n🔄 Syncing {len(registry)} playlist(s)...")
-    for entry in registry:
+    print(f"\n🔄 Syncing {len(entries)} playlist(s)...")
+    for entry in entries:
         try:
             sync_one_playlist(entry, creds)
         except Exception as e:
@@ -547,6 +560,73 @@ def run_sync():
     print("\n🎛️  Generating Rekordbox XML...")
     count = generate_rekordbox_xml()
     print(f"✅ Rekordbox XML written to {REKORDBOX_XML} ({count} unique tracks).")
+
+
+def sync_specific_playlists():
+    """
+    Menu action: show the registry numbered, let the user pick a comma-separated list
+    of numbers (e.g. 1,3,5), and sync only those - in the order typed - then regenerate
+    the XML via run_sync().
+    """
+    registry = load_registry()
+    if not registry:
+        print("\nNo playlists saved yet. Use 'Save a playlist for syncing' first.")
+        return
+
+    print("\n--- Sync Specific Playlists ---")
+    for i, p in enumerate(registry, start=1):
+        print(f"  {i}. {p['name']}  [{p['source']}]")
+
+    raw = input("\nEnter numbers to sync (comma-separated, e.g. 1,3,5): ").strip()
+    if not raw:
+        print("Nothing selected.")
+        return
+
+    selected = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit() or not (1 <= int(token) <= len(registry)):
+            print(f"⚠️  Ignoring invalid entry '{token}'.")
+            continue
+        entry = registry[int(token) - 1]
+        if entry not in selected:   # de-dupe repeated numbers, keep first position
+            selected.append(entry)
+
+    if not selected:
+        print("No valid playlists selected.")
+        return
+    run_sync(entries=selected)
+
+
+def sync_playlists_by_name(names):
+    """
+    Headless helper for --sync-playlist / --sync-playlists. Resolves each given name to
+    its registry entry (matching the slugified name, so "House Vibes" and "house-vibes"
+    both work) and syncs the matches in order, then regenerates the XML via run_sync().
+    A name can match more than one entry if the same playlist name exists on two sources.
+    """
+    registry = load_registry()
+    if not registry:
+        print("No saved playlists to sync. Use 'Save a playlist for syncing' first.")
+        return
+
+    selected = []
+    for name in names:
+        slug = slugify(name)
+        hits = [e for e in registry if e["name"] == slug]
+        if not hits:
+            print(f"⚠️  No saved playlist named '{slug}'.")
+            continue
+        for h in hits:
+            if h not in selected:
+                selected.append(h)
+
+    if not selected:
+        print("No matching playlists to sync.")
+        return
+    run_sync(entries=selected)
 
 
 def sync_one_playlist(entry, creds):
@@ -893,14 +973,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sync",
         action="store_true",
-        help="Headless mode: sync all saved playlists and regenerate rekordbox.xml, then exit. "
+        help="Headless mode: sync ALL saved playlists and regenerate rekordbox.xml, then exit. "
              "No menu, no prompts (used by the weekly automation).",
+    )
+    parser.add_argument(
+        "--sync-playlist",
+        metavar="NAME",
+        help="Headless mode: sync a single saved playlist by its registered name, then exit. "
+             "Example: python mloader.py --sync-playlist house-vibes",
+    )
+    parser.add_argument(
+        "--sync-playlists",
+        metavar="NAME1,NAME2,...",
+        help="Headless mode: sync several saved playlists by name (comma-separated), then exit. "
+             "Example: python mloader.py --sync-playlists english,hindi-party,edm",
     )
     args = parser.parse_args()
 
     try:
         if args.sync:
             run_sync()
+        elif args.sync_playlist:
+            sync_playlists_by_name([args.sync_playlist])
+        elif args.sync_playlists:
+            names = [n.strip() for n in args.sync_playlists.split(",") if n.strip()]
+            sync_playlists_by_name(names)
         else:
             main()
     except KeyboardInterrupt:

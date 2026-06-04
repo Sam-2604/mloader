@@ -44,7 +44,8 @@ Managed library root (synced playlists + generated XML):
 mloader has two entry behaviours, selected by `argparse` in the `__main__` block:
 
 - **Interactive (default):** `python mloader.py` runs `main()`, the menu loop.
-- **Headless sync:** `python mloader.py --sync` runs `run_sync()` once and exits - no menu, no prompts. This is what the weekly `launchd` automation calls.
+- **Headless sync (all):** `python mloader.py --sync` runs `run_sync()` once and exits - no menu, no prompts. This is what the weekly `launchd` automation calls.
+- **Headless sync (specific):** `--sync-playlist <name>` syncs one saved playlist by name; `--sync-playlists <name1,name2,...>` syncs several. Both resolve names via `sync_playlists_by_name()` and exit. The flags are mutually exclusive in practice (checked in priority order: `--sync`, then `--sync-playlist`, then `--sync-playlists`, else interactive).
 
 ---
 
@@ -66,8 +67,9 @@ main()                              run_sync()  (also via --sync)
         │     └── handle_duplicate_downloads()
         ├── 8    add_playlist()
         ├── 9    list_playlists()
-        ├── 10   run_sync()
-        └── 11   reset_spotdl_creds()
+        ├── 10   run_sync()                 (all)
+        ├── 11   sync_specific_playlists()  (pick by number)
+        └── 12   reset_spotdl_creds()
 ```
 
 Standalone downloads carry no in-memory state between iterations. Sync state lives on disk: the registry (`playlists.json`), spotdl's per-playlist `.spotdl` files, scdl's `.sync_archive`, and yt-dlp's `.archive.txt`.
@@ -271,8 +273,15 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 ### `list_playlists()` (menu option 9)
 - Prints every registered playlist with its source, URL, and folder.
 
-### `run_sync()` (menu option 10 and `--sync`)
-- Verifies dependencies, loads the registry, syncs each playlist via `sync_one_playlist()`, then calls `generate_rekordbox_xml()`. No prompts, so it backs both the menu option and the headless flag. Each playlist sync is wrapped in try/except so one failure does not abort the rest.
+### `run_sync(entries=None)` (menu option 10 and `--sync`)
+- Verifies dependencies, loads the registry, syncs each playlist via `sync_one_playlist()`, then calls `generate_rekordbox_xml()`. No prompts, so it backs the menu option, the headless flags, and the selective-sync paths. Each playlist sync is wrapped in try/except so one failure does not abort the rest.
+- **`entries`:** the subset of registry entries to sync. When `None` (default) it syncs the whole registry, so `run_sync()` with no arguments behaves exactly as the original did. Selective callers pass a pre-filtered, ordered list.
+
+### `sync_specific_playlists()` (menu option 11)
+- Prints the registry numbered, reads a comma-separated list of numbers (e.g. `1,3,5`), validates each (ignoring out-of-range or non-numeric tokens with a warning), builds the selected entries in the order typed (de-duping repeats), and calls `run_sync(entries=selected)`.
+
+### `sync_playlists_by_name(names)` (headless `--sync-playlist` / `--sync-playlists`)
+- Resolves each requested name to a registry entry by comparing `slugify(name)` against the stored slug, so `"House Vibes"` and `"house-vibes"` both match. Unmatched names print a warning and are skipped; a name can match more than one entry if the same playlist name exists on two sources. Calls `run_sync(entries=selected)` with the matches in order.
 
 ### `sync_one_playlist(entry, creds)`
 - Runs the source-appropriate native sync, then renames any new files:
