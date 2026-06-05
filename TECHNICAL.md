@@ -16,7 +16,8 @@ mloader/
 External config + state written at runtime (all outside the repo):
 ```
 ~/.config/mloader/
-├── spotdl_creds.json   # Spotify Developer API credentials (first Spotify download)
+├── spotdl_creds.json       # Spotify Developer API credentials (first Spotify download)
+├── soundcloud_creds.json   # SoundCloud OAuth token (first SoundCloud download/sync)
 ├── playlists.json      # Saved-playlist registry for syncing
 └── sync/
     └── <slug>.spotdl   # spotdl per-playlist tracking file (Spotify only)
@@ -69,7 +70,8 @@ main()                              run_sync()  (also via --sync)
         ├── 9    list_playlists()
         ├── 10   run_sync()                 (all)
         ├── 11   sync_specific_playlists()  (pick by number)
-        └── 12   reset_spotdl_creds()
+        ├── 12   reset_spotdl_creds()
+        └── 13   reset_scdl_creds()
 ```
 
 Standalone downloads carry no in-memory state between iterations. Sync state lives on disk: the registry (`playlists.json`), spotdl's per-playlist `.spotdl` files, scdl's `.sync_archive`, and yt-dlp's `.archive.txt`.
@@ -80,6 +82,7 @@ Standalone downloads carry no in-memory state between iterations. Sync state liv
 
 ```python
 CREDS_PATH = os.path.expanduser("~/.config/mloader/spotdl_creds.json")
+SC_CREDS_PATH = os.path.expanduser("~/.config/mloader/soundcloud_creds.json")  # SoundCloud OAuth token
 MLOADER_ROOT = os.path.expanduser("~/Music/mloader")          # managed library + XML root
 DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")        # default for standalone downloads
 PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
@@ -153,7 +156,17 @@ DISK_WARN_THRESHOLD_GB = 1.0
 - **Input:** None (reads `CREDS_PATH` constant).
 - **Output:** Console confirmation. Deletes the file if it exists.
 - **When to use:** Wrong credentials were saved, the Spotify Developer app was deleted and replaced, or the current app is rate-limited and you want to switch to a second app.
-- **Triggered by:** Menu option 8.
+- **Triggered by:** Menu option 12.
+
+---
+
+### SoundCloud token functions
+SoundCloud has its own credential trio mirroring Spotify's, because many public tracks 403 on the audio stream when fetched anonymously; a logged-in OAuth token (passed to scdl as `--auth-token`) fixes that.
+
+- **`get_scdl_token()`** - returns the saved token from `SC_CREDS_PATH`, or on first run prompts for it, validates it via `validate_scdl_token()`, re-prompts on rejection, and saves `{"auth_token": "..."}`. Returns `None` if the user leaves it blank (scdl then runs unauthenticated). Strips a leading `OAuth ` prefix via `_clean_oauth()`. Triggered by a standalone SoundCloud download (menu 4).
+- **`validate_scdl_token(token)`** - scrapes a public `client_id` from soundcloud.com's JS, then calls the authenticated `/me` endpoint with `Authorization: OAuth <token>`. Returns `True` on HTTP 200, `False` on 401/403, and `True` on scrape/network failure (cannot prove it invalid, so it does not block). Stdlib only.
+- **`load_scdl_token_noninteractive()`** - returns the saved token or `None` without prompting, for headless `--sync`.
+- **`reset_scdl_creds()`** - deletes `SC_CREDS_PATH`. Triggered by menu option 13.
 
 ---
 
@@ -229,14 +242,15 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 
 ---
 
-### `download_scdl(url, output_path)`
+### `download_scdl(url, output_path, auth_token=None)`
 - **Purpose:** Download SoundCloud tracks, sets, or profiles.
-- **Input:** SoundCloud URL, output path string.
+- **Input:** SoundCloud URL, output path string, and an optional `auth_token`.
 - **Output:** List of error strings.
 - **How it works:** Calls scdl as a subprocess with:
   - `-l url` - the SoundCloud link to download
   - `--path output_path` - destination folder
   - `--onlymp3` - enforces MP3 output format. Without this, scdl may download in the source format (sometimes opus or aac depending on the upload)
+  - `--auth-token <token>` - appended only when `auth_token` is set, so scdl authenticates and can fetch tracks that 403 anonymously
 - **`check=False`:** Same reasoning as spotdl - non-zero exit is caught manually.
 
 ---
@@ -283,10 +297,10 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 ### `sync_playlists_by_name(names)` (headless `--sync-playlist` / `--sync-playlists`)
 - Resolves each requested name to a registry entry by comparing `slugify(name)` against the stored slug, so `"House Vibes"` and `"house-vibes"` both match. Unmatched names print a warning and are skipped; a name can match more than one entry if the same playlist name exists on two sources. Calls `run_sync(entries=selected)` with the matches in order.
 
-### `sync_one_playlist(entry, creds)`
+### `sync_one_playlist(entry, creds, sc_token=None)`
 - Runs the source-appropriate native sync, then renames any new files:
   - **spotify:** `spotdl sync` via `_spotdl_base()` (the shim). First run (no `.spotdl` file yet) downloads everything and writes the tracking file with `--save-file`; later runs sync from the tracking file, which adds new tracks **and deletes tracks removed from the playlist**. Skipped with a message if no credentials are available.
-  - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks.
+  - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks. `--auth-token <sc_token>` is appended when a token is available, so authenticated requests avoid the anonymous 403s. `run_sync()` loads the token once via `load_scdl_token_noninteractive()` and passes it in.
   - **youtube:** `download_ytdlp(url, output_path, archive_path=.archive.txt)` so already-fetched videos are skipped (additive only, no deletion).
 - New files are detected with the same before/after `get_all_mp3s` diff used by standalone downloads and passed through `rename_files`.
 - **Returns notable lines.** For spotdl and scdl the command is run through `_run_and_capture()`, which attaches the child to a pseudo-terminal (`pty`) and tees its output. The pty is essential: spotdl/scdl detect a non-terminal stdout and strip colours, drop progress bars, and block-buffer, so a plain pipe would kill their live UI; the pty makes them believe they are on a real terminal, preserving colours, progress bars, and "retry will occur after Xs" countdowns in real time while every byte is still captured. (`_run_and_capture_pipe()` is a line-streamed fallback for platforms without `pty`, e.g. Windows.) `_parse_sync_errors()` then strips ANSI codes and extracts lines containing any of `SYNC_ERROR_KEYWORDS` (`error`, `failed`, `skipped`, `not found`, case-insensitive, de-duplicated), explicitly excluding rate-limit retry countdowns. For youtube the yt-dlp logger's own error list is returned. `run_sync()` collects these per playlist and prints them in a "Sync notices" summary, the same way standalone yt-dlp errors are surfaced.
@@ -358,7 +372,19 @@ Location: `~/.config/mloader/spotdl_creds.json`
 
 These are **not** your Spotify account credentials. They are credentials for a free Developer app you register at developer.spotify.com. Spotify uses them to rate-limit API access per app rather than per user.
 
-The file is created by `get_spotdl_creds()` on first Spotify download and read on every subsequent one. Delete it (or use menu option 8) to trigger re-entry.
+The file is created by `get_spotdl_creds()` on first Spotify download and read on every subsequent one. Delete it (or use menu option 12) to trigger re-entry.
+
+### SoundCloud token file
+
+Location: `~/.config/mloader/soundcloud_creds.json`
+
+```json
+{
+  "auth_token": "2-XXXXXX-XXXXXX-XXXXXXXXXXXX"
+}
+```
+
+This **is** tied to your SoundCloud account (it is your logged-in OAuth token), so it is sensitive and git-ignored. Created by `get_scdl_token()` on first SoundCloud download (after validation), read on every scdl call, and passed as `--auth-token`. Delete it (or use menu option 13) to re-enter.
 
 ---
 

@@ -25,6 +25,7 @@ except ImportError:
 # CONSTANTS
 # ─────────────────────────────────────────────
 CREDS_PATH = os.path.expanduser("~/.config/mloader/spotdl_creds.json")
+SC_CREDS_PATH = os.path.expanduser("~/.config/mloader/soundcloud_creds.json")
 
 # ── MLOADER LIBRARY ROOT ── the managed library where synced playlists live, organised
 # as <root>/<source>/<playlist-slug>/. Also where rekordbox.xml is written. Change this
@@ -72,9 +73,10 @@ def main():
         print("11. Sync specific playlists")
         print("\n--- Settings ---")
         print("12. Reset Spotify credentials")
+        print("13. Reset SoundCloud credentials")
         print("0. Exit")
 
-        choice = input("\nSelect an option (0-12): ").strip()
+        choice = input("\nSelect an option (0-13): ").strip()
 
         if choice == '0':
             print("Goodbye!")
@@ -95,6 +97,9 @@ def main():
             continue
         if choice == '12':
             reset_spotdl_creds()
+            continue
+        if choice == '13':
+            reset_scdl_creds()
             continue
         if choice not in STANDALONE_SOURCES:
             print("❌ Invalid choice. Please try again.")
@@ -130,7 +135,8 @@ def main():
                 creds = get_spotdl_creds()
                 download_errors = download_spotdl(url, output_path, creds)
             elif choice == '4':
-                download_errors = download_scdl(url, output_path)
+                token = get_scdl_token()
+                download_errors = download_scdl(url, output_path, auth_token=token)
             else:
                 download_errors = download_ytdlp(url, output_path)
 
@@ -291,6 +297,114 @@ def reset_spotdl_creds():
 
 
 # ─────────────────────────────────────────────
+# SOUNDCLOUD CREDENTIALS
+# ─────────────────────────────────────────────
+def _clean_oauth(token):
+    """Strip a leading 'OAuth ' prefix in case the user pasted the whole header value."""
+    token = token.strip().strip('"')
+    if token.lower().startswith("oauth "):
+        token = token[6:].strip()
+    return token
+
+
+def validate_scdl_token(token):
+    """
+    Confirm a SoundCloud OAuth token works before saving it, mirroring how Spotify creds
+    are validated. Scrapes a public client_id, then calls the authenticated /me endpoint
+    with the token. Returns True if SoundCloud accepts it. Uses only stdlib (urllib).
+    On a scrape/network failure it returns True (cannot prove it invalid, so don't block).
+    """
+    def _get(u):
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+        return urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+    try:
+        client_id = None
+        for js in re.findall(r'<script[^>]+src="(https://[^"]+\.js)"', _get("https://soundcloud.com/"))[::-1]:
+            try:
+                m = re.search(r'client_id:"([0-9a-zA-Z]{20,})"', _get(js))
+                if m:
+                    client_id = m.group(1)
+                    break
+            except Exception:
+                continue
+        if not client_id:
+            return True  # could not scrape a client_id; let scdl be the judge
+        req = urllib.request.Request(
+            f"https://api-v2.soundcloud.com/me?client_id={client_id}",
+            headers={"Authorization": f"OAuth {token}", "User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError:
+        return False   # 401/403 -> token genuinely rejected
+    except Exception:
+        return True    # network hiccup -> don't block saving
+
+
+def get_scdl_token():
+    """
+    Load the saved SoundCloud auth token, or prompt for it on first run, validate it, and
+    save it. Returns the token string, or None if the user declines (scdl then runs
+    unauthenticated).
+
+    Many SoundCloud tracks fail to download anonymously (yt-dlp gets HTTP 403 on the audio
+    stream); a logged-in OAuth token fixes that, the same way personal Spotify credentials
+    fix Spotify rate limits.
+    """
+    os.makedirs(os.path.dirname(SC_CREDS_PATH), exist_ok=True)
+
+    if os.path.exists(SC_CREDS_PATH):
+        try:
+            with open(SC_CREDS_PATH, "r") as f:
+                return json.load(f).get("auth_token")
+        except (json.JSONDecodeError, OSError):
+            pass  # fall through to re-prompt if the file is unreadable
+
+    print("\n--- SoundCloud Auth Setup (First Run) ---")
+    print("Some SoundCloud tracks need a logged-in token to download.")
+    print("Go to soundcloud.com (logged in) -> open Dev Tools (Cmd+Option+I) -> Network tab ->")
+    print("play any track -> click a request to api-v2.soundcloud.com -> in Request Headers")
+    print("find 'Authorization: OAuth ...' and copy the part after 'OAuth '.")
+    print("It should look like '2-XXXXXX-XXXXXX-XXXXXXXXXXXX'.\n")
+
+    while True:
+        token = _clean_oauth(input("Paste your SoundCloud OAuth token (leave blank to skip): "))
+        if not token:
+            print("⚠️  No token entered; continuing without authentication.")
+            return None
+        print("⏳ Validating token with SoundCloud...")
+        if validate_scdl_token(token):
+            break
+        print("❌ Token rejected by SoundCloud. Make sure you copied the value after 'OAuth ' "
+              "(it starts with '2-'). Try again, or leave blank to skip.")
+
+    with open(SC_CREDS_PATH, "w") as f:
+        json.dump({"auth_token": token}, f, indent=2)
+    print(f"✅ SoundCloud token validated and saved to {SC_CREDS_PATH}")
+    return token
+
+
+def load_scdl_token_noninteractive():
+    """Load the saved SoundCloud token without prompting (for headless sync). None if absent."""
+    if os.path.exists(SC_CREDS_PATH):
+        try:
+            with open(SC_CREDS_PATH, "r") as f:
+                return json.load(f).get("auth_token")
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
+
+
+def reset_scdl_creds():
+    """Delete the saved SoundCloud token so the user can re-enter it."""
+    if os.path.exists(SC_CREDS_PATH):
+        os.remove(SC_CREDS_PATH)
+        print("✅ SoundCloud token cleared. You will be prompted to re-enter it on the next SoundCloud download.")
+    else:
+        print("ℹ️  No saved SoundCloud token found.")
+
+
+# ─────────────────────────────────────────────
 # DOWNLOADERS
 # ─────────────────────────────────────────────
 class YTDLPLogger:
@@ -413,14 +527,20 @@ def download_spotdl(url, output_path, creds):
     ]
 
 
-def download_scdl(url, output_path):
-    """Download SoundCloud tracks via scdl. --onlymp3 enforces mp3 output regardless of source format."""
+def download_scdl(url, output_path, auth_token=None):
+    """
+    Download SoundCloud tracks via scdl. --onlymp3 enforces mp3 output regardless of source
+    format. auth_token (optional): a SoundCloud OAuth token passed as --auth-token, which
+    lets scdl download tracks that fail anonymously (HTTP 403 on the audio stream).
+    """
     cmd = [
         "scdl",
         "-l", url,
         "--path", output_path,
         "--onlymp3",
     ]
+    if auth_token:
+        cmd += ["--auth-token", auth_token]
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
         return ["scdl encountered an error. Check the console output above for details."]
@@ -550,11 +670,12 @@ def run_sync(entries=None):
         return
 
     creds = load_creds_noninteractive()
+    sc_token = load_scdl_token_noninteractive()
     print(f"\n🔄 Syncing {len(entries)} playlist(s)...")
     sync_issues = {}   # playlist name -> list of notable lines
     for entry in entries:
         try:
-            errs = sync_one_playlist(entry, creds)
+            errs = sync_one_playlist(entry, creds, sc_token)
             if errs:
                 sync_issues[entry.get("name")] = errs
         except Exception as e:
@@ -734,13 +855,16 @@ def _parse_sync_errors(text):
     return found
 
 
-def sync_one_playlist(entry, creds):
+def sync_one_playlist(entry, creds, sc_token=None):
     """
     Sync a single registered playlist with its source's native sync mechanism:
       - spotify    : `spotdl sync` (handles new downloads AND deletions on its own)
       - soundcloud : `scdl --sync` against a per-folder archive
       - youtube    : yt-dlp with a download-archive so existing tracks are skipped
     New files are renamed to the standard 'Song - Artist.mp3' afterward.
+
+    sc_token (optional): a SoundCloud OAuth token passed to scdl as --auth-token so it can
+    download tracks that fail anonymously.
 
     Returns a list of notable lines (errors / failures / skips / not-found) so they show
     up individually in the sync summary. For spotdl and scdl, output is teed to the
@@ -795,6 +919,8 @@ def sync_one_playlist(entry, creds):
             "--path", output_path,
             "--onlymp3",
         ]
+        if sc_token:
+            cmd += ["--auth-token", sc_token]
         errors = _parse_sync_errors(_run_and_capture(cmd))
 
     elif source == "youtube":

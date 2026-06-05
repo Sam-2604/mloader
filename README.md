@@ -80,6 +80,25 @@ To re-enter credentials at any time, select **option 12** from the main menu.
 
 ---
 
+## SoundCloud Setup (optional, but recommended)
+
+Many SoundCloud tracks fail to download anonymously: the public stream resolver returns HTTP 403 even for ordinary public tracks, so a playlist of 300 can come back missing dozens. Logging in with your own SoundCloud OAuth token fixes this. It is optional - downloads work without it - but a token gets the tracks that otherwise 403.
+
+On the first SoundCloud download (or sync), mloader prompts for the token, validates it against SoundCloud, and saves it to `~/.config/mloader/soundcloud_creds.json`. It is then passed as `--auth-token` to every scdl call automatically.
+
+**How to get your token:**
+
+1. Go to [soundcloud.com](https://soundcloud.com) logged in, and open Dev Tools (Cmd+Option+I / Ctrl+Shift+I)
+2. Open the **Network** tab and play any track
+3. Click a request to **`api-v2.soundcloud.com`**, and in **Request Headers** find `Authorization: OAuth ...`
+4. Copy everything after `OAuth ` - it looks like `2-XXXXXX-XXXXXX-XXXXXXXXXXXX`
+
+(Alternatively: Dev Tools > **Application** > Cookies > `soundcloud.com` > copy the `oauth_token` value.)
+
+To re-enter the token at any time, select **option 13** from the main menu.
+
+---
+
 ## Usage
 
 ```bash
@@ -106,6 +125,7 @@ python mloader.py
 
 --- Settings ---
 12. Reset Spotify credentials
+13. Reset SoundCloud credentials
 0. Exit
 ```
 
@@ -247,6 +267,7 @@ Files where ID3 tags are missing or malformed are kept under their original down
 - Regional or non-Latin-titled tracks (Hindi, Tamil, etc.) have lower match accuracy on YouTube. Direct YouTube downloads are more reliable for these
 
 **SoundCloud**
+- Many public tracks return HTTP 403 on the audio stream when downloaded anonymously, so a large playlist can come back missing dozens of tracks. Setting your SoundCloud OAuth token (see SoundCloud Setup) authenticates the requests and fixes this. Re-run the sync after adding the token to backfill the missing tracks
 - Tracks with copyright mutes (silence replacing flagged audio) cannot be recovered. SoundCloud serves the muted version and that is what gets downloaded. Get the clean version from Spotify or YouTube instead
 - Private tracks will silently fail
 

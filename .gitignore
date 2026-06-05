@@ -17,6 +17,7 @@ FEEDBACK.md
 # These normally live under ~/.config/mloader and ~/Music/mloader (outside the repo),
 # but these patterns guard against them ever landing inside it.
 spotdl_creds.json
+soundcloud_creds.json
 playlists.json
 *.spotdl
 .archive.txt
