@@ -91,7 +91,9 @@ DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")        # default for stan
 PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
 SYNC_DIR = os.path.expanduser("~/.config/mloader/sync")       # spotdl .spotdl tracking files
 CACHE_DIR = os.path.expanduser("~/.config/mloader/cache")     # cached Spotify tracklists
+CONFIG_PATH = os.path.expanduser("~/.config/mloader/config.json")  # general settings (mixxx_enabled)
 REKORDBOX_XML = os.path.join(MLOADER_ROOT, "rekordbox.xml")
+MIXXX_APP_BINARY = "/Applications/Mixxx.app/Contents/MacOS/mixxx"   # checked before PATH
 SYNC_SOURCES = {"spotify": "spotify", "soundcloud": "soundcloud", "youtube": "youtube"}
 DISK_WARN_THRESHOLD_GB = 1.0
 ```
@@ -295,7 +297,7 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 - Prints every registered playlist with its source, URL, and folder.
 
 ### `run_sync(entries=None, force_full=False)` (menu option 10 and `--sync`)
-- Verifies dependencies, loads the registry, syncs each playlist via `sync_one_playlist()`, then calls `generate_rekordbox_xml()`. No prompts, so it backs the menu option, the headless flags, and the selective-sync paths. Each playlist sync is wrapped in try/except so one failure does not abort the rest.
+- Verifies dependencies, loads the registry, syncs each playlist via `sync_one_playlist()`, then calls `run_mixxx_analysis()` on the aggregated newly downloaded paths, then calls `generate_rekordbox_xml()`. The Mixxx step sits between syncing and XML generation by design (see "BPM and Key Analysis"). No prompts, so it backs the menu option, the headless flags, and the selective-sync paths. Each playlist sync is wrapped in try/except so one failure does not abort the rest.
 - **`entries`:** the subset of registry entries to sync. When `None` (default) it syncs the whole registry, so `run_sync()` with no arguments behaves exactly as the original did. Selective callers pass a pre-filtered, ordered list.
 - **`force_full`:** forwarded to each `sync_one_playlist`; bypasses the Spotify cache and runs a full spotdl sync (the `--force-full-sync` flag).
 - **Summary:** collects a result dict per playlist and hands them to `_print_sync_summary()`, which prints one scannable status line per playlist (`+N new` / `-N removed` / `up to date` / `skipped`), a totals line, and an **errors-only** section. Routine skipped/already-downloaded tracks are never itemised, so a 2000-track sync stays readable.
@@ -307,7 +309,7 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 - Resolves each requested name to a registry entry by comparing `slugify(name)` against the stored slug, so `"House Vibes"` and `"house-vibes"` both match. Unmatched names print a warning and are skipped; a name can match more than one entry if the same playlist name exists on two sources. Calls `run_sync(entries=selected)` with the matches in order.
 
 ### `sync_one_playlist(entry, creds, sc_token=None, force_full=False)`
-- Runs the source-appropriate sync and returns a result dict `{name, source, new, removed, errors, status}`:
+- Runs the source-appropriate sync and returns a result dict `{name, source, new, removed, new_paths, errors, status}` (`new_paths` lists the final on-disk paths of the newly added files, which `run_sync()` aggregates and feeds to Mixxx for BPM/key analysis):
   - **spotify:** cache-based incremental sync by default (`_spotify_incremental_sync`); see "Spotify metadata cache" below. With `force_full=True`, or if the incremental path raises, it falls back to `_spotify_full_sync` (the original `spotdl sync`). Skipped (no work) if no credentials are saved.
   - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks. The same pinned `--name-format` / `--playlist-name-format` / `--no-playlist-folder` flags as `download_scdl` are passed (see "SoundCloud filename scheme" below). `--auth-token <sc_token>` is appended when a token is available, so authenticated requests avoid the anonymous 403s. `run_sync()` loads the token once via `load_scdl_token_noninteractive()` and passes it in.
   - **youtube:** `download_ytdlp(url, output_path, archive_path=.archive.txt)` so already-fetched videos are skipped (additive only, no deletion).
@@ -383,6 +385,38 @@ So a track first pulled standalone, then synced (or vice-versa), landed on disk 
 - **Playlist tree:** `_dir_to_node()` recursively mirrors the folder structure - a folder with sub-folders becomes a `Type="0"` node, a folder with mp3s becomes a `Type="1"` playlist node, and a folder with both gets sub-folder nodes plus a playlist node for its own tracks. `_playlist_node()` resolves each file to its collection `TrackID` (deduped within the playlist) and emits `<TRACK Key="...">` references. A song in two folders is referenced by the same `TrackID` in both playlist nodes.
 - **Locations:** `_file_uri()` produces `file://localhost/` + a percent-encoded absolute path, per the Rekordbox XML spec.
 - Output is written with `ET.indent()` for readability and a UTF-8 XML declaration, overwriting any previous file.
+
+---
+
+## BPM and Key Analysis
+
+mloader can optionally hand newly synced tracks to **Mixxx**, which analyses each one and writes BPM and key directly into the file's ID3 tags. Because Rekordbox reads those tags on XML import, the BPM and key columns are populated without Rekordbox doing any analysis of its own (the free tier does not). The whole step is optional and never blocks or aborts a sync.
+
+### Ordering constraint (why it runs before the XML)
+`run_sync()` calls `run_mixxx_analysis()` **after** all playlists have finished downloading and **before** `generate_rekordbox_xml()`. This ordering is load-bearing: the XML is built by reading ID3 tags off disk, so the BPM and key tags Mixxx writes must already be present when the XML is generated. If analysis ran after XML generation, the data would not appear until the next sync.
+
+### Once per run, not per playlist
+Mixxx exposes no targeted per-file or per-folder headless analysis mode, so there is nothing to gain from invoking it per playlist. `run_sync()` aggregates the newly downloaded paths from every playlist's result dict (`new_paths`) into a single list and makes **one** `run_mixxx_analysis()` call per sync run. `sync_one_playlist()` records the final on-disk paths (post-rename for YouTube) in `result["new_paths"]` precisely so this aggregation feeds Mixxx the exact files that changed.
+
+### `run_mixxx_analysis(paths)`
+- No-ops immediately (skips silently) when `mixxx_enabled()` is false or when `paths` is empty.
+- Locates the binary via `find_mixxx_binary()`. If Mixxx is not installed, it prints `Mixxx not found -- skipping BPM/key analysis...` and returns. It never hard-fails on a missing Mixxx.
+- Otherwise it runs Mixxx over the paths, streaming output line by line with a `[mixxx]` prefix so it is visually distinct from scdl/spotdl/yt-dlp output, while capturing it.
+- A non-zero exit code prints a warning and returns; any exception is caught and warned about. Analysis failure can never abort a sync.
+- No timeout is set on purpose. A long analysis is allowed to run; the user can Ctrl+C.
+
+### Binary lookup order
+`find_mixxx_binary()` checks, in order:
+1. The macOS app bundle binary `/Applications/Mixxx.app/Contents/MacOS/mixxx` (the constant `MIXXX_APP_BINARY`).
+2. A `mixxx` on `PATH` (`shutil.which("mixxx")`), covering a brew or Linux install.
+
+Returns the path string, or `None` if neither is found.
+
+### The `mixxx_enabled` config key
+A new general settings file, `~/.config/mloader/config.json` (constant `CONFIG_PATH`), holds a single boolean key `mixxx_enabled`. `load_config()` / `save_config()` read and write it; `mixxx_enabled()` returns the value, defaulting to **false**. Settings menu option 14 (`toggle_mixxx_analysis()`) flips it. The main menu shows the current state inline (`currently on` / `currently off`).
+
+### Why it is disabled by default (Mixxx has no headless analysis CLI)
+Step 1 research against the Mixxx 2.4 command-line reference confirmed there is **no headless or batch analysis flag**. The documented command-line options only load files into GUI decks at startup and require a display; there is no analyse-and-exit mode. mloader therefore ships the hook fully wired but **off by default**, as a forward-looking integration: enabling it today launches the Mixxx GUI during a sync rather than analysing in the background. If and when Mixxx adds a real headless analysis flag, only the command built in `run_mixxx_analysis()` needs updating (prepend the flag); the config key, Settings toggle, lookup order, and sync wiring are already in place.
 
 ---
 
@@ -492,6 +526,7 @@ The guiding principle throughout: **never crash silently**. Every failure either
 | `scdl` | pip | SoundCloud download |
 | `mutagen` | pip | Read and write MP3 ID3 tags for the rename feature |
 | `ffmpeg` | system | Audio extraction and MP3 conversion - called by yt-dlp internally |
+| `mixxx` | system (optional) | BPM and key analysis written to ID3 tags; off by default, see "BPM and Key Analysis" |
 | `urllib` | stdlib | Spotify credential validation HTTP request |
 | `base64` | stdlib | Encoding credentials for Spotify's Basic Auth header |
 | `json` | stdlib | Reading and writing the credentials config file |

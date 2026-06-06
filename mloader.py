@@ -40,7 +40,14 @@ DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")
 PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
 SYNC_DIR = os.path.expanduser("~/.config/mloader/sync")
 CACHE_DIR = os.path.expanduser("~/.config/mloader/cache")   # local Spotify tracklist cache
+CONFIG_PATH = os.path.expanduser("~/.config/mloader/config.json")  # general settings (e.g. mixxx_enabled)
 REKORDBOX_XML = os.path.join(MLOADER_ROOT, "rekordbox.xml")
+
+# ── MIXXX ── optional BPM/key analysis engine. We look for the macOS .app bundle binary
+# first, then fall back to whatever `mixxx` is on PATH (a brew/Linux install). See
+# run_mixxx_analysis() and the "BPM and Key Analysis" section of TECHNICAL.md for why this
+# is disabled by default (Mixxx has no headless analysis CLI as of 2.4).
+MIXXX_APP_BINARY = "/Applications/Mixxx.app/Contents/MacOS/mixxx"
 
 # Sources that can be registered for syncing, mapped to their library sub-folder.
 SYNC_SOURCES = {"spotify": "spotify", "soundcloud": "soundcloud", "youtube": "youtube"}
@@ -75,9 +82,11 @@ def main():
         print("\n--- Settings ---")
         print("12. Reset Spotify credentials")
         print("13. Reset SoundCloud credentials")
+        mixxx_state = "on" if mixxx_enabled() else "off"
+        print(f"14. Toggle Mixxx BPM/key analysis (currently {mixxx_state})")
         print("0. Exit")
 
-        choice = input("\nSelect an option (0-13): ").strip()
+        choice = input("\nSelect an option (0-14): ").strip()
 
         if choice == '0':
             print("Goodbye!")
@@ -101,6 +110,9 @@ def main():
             continue
         if choice == '13':
             reset_scdl_creds()
+            continue
+        if choice == '14':
+            toggle_mixxx_analysis()
             continue
         if choice not in STANDALONE_SOURCES:
             print("❌ Invalid choice. Please try again.")
@@ -477,6 +489,117 @@ def reset_scdl_creds():
 
 
 # ─────────────────────────────────────────────
+# GENERAL CONFIG
+# ─────────────────────────────────────────────
+def load_config():
+    """Return the general settings dict from config.json (empty dict if missing/unreadable)."""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_config(config):
+    """Write the general settings dict back to config.json."""
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def mixxx_enabled():
+    """
+    Whether automatic Mixxx BPM/key analysis is turned on. Defaults to FALSE.
+
+    The brief asked for a default of true, but Step 1 research confirmed Mixxx has no
+    headless/batch analysis CLI (as of 2.4 the only options load files into GUI decks and
+    need a display - see TECHNICAL.md). So the hook ships wired but OFF, exactly as the
+    fallback in the brief requires, and can be flipped on from Settings the day Mixxx adds
+    a real analyse-and-exit flag.
+    """
+    return load_config().get("mixxx_enabled", False)
+
+
+# ─────────────────────────────────────────────
+# MIXXX BPM / KEY ANALYSIS
+# ─────────────────────────────────────────────
+def find_mixxx_binary():
+    """
+    Locate the Mixxx executable. Lookup order: the macOS .app bundle binary first
+    (/Applications/Mixxx.app/Contents/MacOS/mixxx), then a `mixxx` on PATH (brew/Linux).
+    Returns the path string, or None if Mixxx is not installed.
+    """
+    if os.path.exists(MIXXX_APP_BINARY):
+        return MIXXX_APP_BINARY
+    return shutil.which("mixxx")
+
+
+def run_mixxx_analysis(paths):
+    """
+    Run Mixxx over the given MP3 paths so it writes BPM and key into their ID3 tags, which
+    Rekordbox then reads on XML import. Called once per sync run AFTER downloads finish and
+    BEFORE the Rekordbox XML is regenerated, so the analysed tags land in the XML.
+
+    This step is always optional and never aborts a sync:
+      - mixxx_enabled is false (the default): skip silently
+      - no new files this run: skip silently
+      - Mixxx not installed: print a warning and return
+      - Mixxx exits non-zero / errors out: print a warning and return (never raise)
+
+    IMPORTANT LIMITATION: Mixxx has no headless/batch analysis CLI (verified against the 2.4
+    command-line reference - the documented options only load files into GUI decks and need a
+    display). Passing file paths is the closest documented entry point, but it launches the
+    Mixxx GUI rather than analysing-and-exiting, which is why this is disabled by default.
+    The invocation is kept real so that when Mixxx ships a true `--analyze`-style flag, only
+    the command below needs updating. No timeout is set on purpose - per the brief, a long
+    analysis is left to run and the user can Ctrl+C.
+    """
+    if not mixxx_enabled():
+        return  # disabled by default - skip silently
+    if not paths:
+        return  # nothing new to analyse
+
+    binary = find_mixxx_binary()
+    if not binary:
+        print("⚠️  Mixxx not found -- skipping BPM/key analysis. Install Mixxx for automatic analysis.")
+        return
+
+    print(f"\n🎚️  [mixxx] Analysing {len(paths)} new track(s) for BPM and key...")
+    # When Mixxx adds a real headless flag, prepend it here (e.g. ["--analyze"]).
+    cmd = [binary] + list(paths)
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        for line in proc.stdout:
+            # Prefix every line so Mixxx output is visually distinct from scdl/spotdl/yt-dlp.
+            print(f"[mixxx] {line}", end="")
+        proc.wait()
+        if proc.returncode != 0:
+            print(f"⚠️  [mixxx] exited with code {proc.returncode}; BPM/key analysis may be "
+                  f"incomplete. Continuing without aborting the sync.")
+    except Exception as e:
+        print(f"⚠️  [mixxx] could not run analysis: {e}. Continuing without aborting the sync.")
+
+
+def toggle_mixxx_analysis():
+    """Settings action: flip the mixxx_enabled flag in config.json on or off."""
+    config = load_config()
+    new_state = not config.get("mixxx_enabled", False)
+    config["mixxx_enabled"] = new_state
+    save_config(config)
+    if new_state:
+        print("✅ Mixxx BPM/key analysis ENABLED.")
+        print("⚠️  Note: Mixxx has no headless analysis CLI yet, so enabling this launches the")
+        print("    Mixxx GUI during a sync rather than analysing in the background. See the")
+        print("    'BPM and Key Analysis' section of TECHNICAL.md for the full caveat.")
+    else:
+        print("✅ Mixxx BPM/key analysis DISABLED.")
+
+
+# ─────────────────────────────────────────────
 # DOWNLOADERS
 # ─────────────────────────────────────────────
 class YTDLPLogger:
@@ -762,7 +885,15 @@ def run_sync(entries=None, force_full=False):
         except Exception as e:
             print(f"  ❌ {entry.get('name')}: {e}")
             results.append({"name": entry.get("name"), "source": entry.get("source"),
-                            "new": 0, "removed": 0, "errors": [f"Critical error: {e}"], "status": "error"})
+                            "new": 0, "removed": 0, "new_paths": [],
+                            "errors": [f"Critical error: {e}"], "status": "error"})
+
+    # Analyse every newly downloaded track for BPM/key BEFORE the XML is built, so the tags
+    # Mixxx writes are picked up by generate_rekordbox_xml(). One pass per sync run (not per
+    # playlist) since Mixxx offers no targeted per-file headless mode. No-op unless the user
+    # has turned analysis on in Settings (see run_mixxx_analysis / mixxx_enabled).
+    new_paths = [p for r in results for p in r.get("new_paths", [])]
+    run_mixxx_analysis(new_paths)
 
     print("\n🎛️  Generating Rekordbox XML...")
     count = generate_rekordbox_xml()
@@ -1120,7 +1251,8 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
     url = entry["url"]
     output_path = os.path.expanduser(entry["output_path"])
     os.makedirs(output_path, exist_ok=True)
-    result = {"name": name, "source": source, "new": 0, "removed": 0, "errors": [], "status": "ok"}
+    result = {"name": name, "source": source, "new": 0, "removed": 0,
+              "new_paths": [], "errors": [], "status": "ok"}
 
     print(f"\n── {name} [{source}] ──")
     files_before = get_all_mp3s(output_path)
@@ -1178,8 +1310,13 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
     # soundcloud branch); rename_files uses a different character-sanitization path, so
     # renaming would drift the on-disk name from scdl's --sync archive entry and break
     # dedup on the next sync. Both are left as-is; only YouTube (yt-dlp) files are renamed.
+    # new_paths carries the FINAL on-disk paths (post-rename) so run_sync can feed exactly
+    # the newly added files to Mixxx for BPM/key analysis.
     if new_files and source not in ("spotify", "soundcloud"):
-        rename_files(new_files)
+        renamed, _ = rename_files(new_files)
+        result["new_paths"] = renamed
+    else:
+        result["new_paths"] = new_files
     if result["errors"]:
         result["status"] = "error"
 

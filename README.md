@@ -41,6 +41,15 @@ Verify the install worked:
 ffmpeg -version
 ```
 
+**Mixxx (optional)** enables automatic BPM and key analysis. When installed and turned on, mloader can hand newly synced tracks to Mixxx, which writes BPM and key into their ID3 tags so Rekordbox shows those columns after importing the XML. Without Mixxx, everything still works, but the BPM and key columns in Rekordbox stay empty (Rekordbox free tier does not analyse them itself).
+
+```bash
+# macOS
+brew install --cask mixxx
+```
+
+Heads up: Mixxx has no headless analysis command yet, so this feature is off by default. See [TECHNICAL.md](TECHNICAL.md) ("BPM and Key Analysis") before turning it on.
+
 ---
 
 ## Installation
@@ -232,6 +241,7 @@ Every sync regenerates `~/Music/mloader/rekordbox.xml`, ready to import into Rek
 - Every folder becomes a Rekordbox playlist, mirroring your library's folder tree.
 - The collection is **deduplicated by title + artist (case-insensitive)**: if the same song exists as two files in two folders, it appears **once** in the collection but is referenced in **both** playlists. No duplicate library entries in Rekordbox.
 - Track locations are written as `file://localhost/` URLs per the Rekordbox XML spec.
+- BPM and key are not analysed by mloader itself. If you install Mixxx and enable analysis (Settings option 14), Mixxx writes BPM and key into each track's ID3 tags before the XML is built, so those columns are populated in Rekordbox. Without Mixxx, the BPM and key columns stay empty.
 
 ---
 
@@ -320,6 +330,7 @@ The file downloaded successfully but has no ID3 tags embedded, so mloader cannot
 | `scdl` | SoundCloud downloads |
 | `mutagen` | ID3 tag reading for file renaming |
 | `ffmpeg` | Audio extraction and MP3 conversion (system install, not pip) |
+| `mixxx` | Optional BPM and key analysis written to ID3 tags (app install, not pip) |
 
 ---
 
