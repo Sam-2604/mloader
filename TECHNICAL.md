@@ -254,8 +254,11 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
   - `-l url` - the SoundCloud link to download
   - `--path output_path` - destination folder
   - `--onlymp3` - enforces MP3 output format. Without this, scdl may download in the source format (sometimes opus or aac depending on the upload)
+  - `--name-format "{title} - {user[username]}"` and `--playlist-name-format "{title} - {user[username]}"` - **pin a single, consistent filename scheme** (see "SoundCloud filename scheme" below). Both are set to the same value so a track is named identically whether it is fetched as a single link or as part of a playlist.
+  - `--no-playlist-folder` - write files flat into `output_path` rather than nesting them under a subfolder named after the playlist
   - `--auth-token <token>` - appended only when `auth_token` is set, so scdl authenticates and can fetch tracks that 403 anonymously
 - **`check=False`:** Same reasoning as spotdl - non-zero exit is caught manually.
+- **The same flags are repeated verbatim in `sync_one_playlist`'s soundcloud branch.** Keeping the two call sites in lock-step is the whole point - see "SoundCloud filename scheme" below for why a mismatch caused a 506-files-for-323-tracks duplication.
 
 ---
 
@@ -306,9 +309,9 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 ### `sync_one_playlist(entry, creds, sc_token=None, force_full=False)`
 - Runs the source-appropriate sync and returns a result dict `{name, source, new, removed, errors, status}`:
   - **spotify:** cache-based incremental sync by default (`_spotify_incremental_sync`); see "Spotify metadata cache" below. With `force_full=True`, or if the incremental path raises, it falls back to `_spotify_full_sync` (the original `spotdl sync`). Skipped (no work) if no credentials are saved.
-  - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks. `--auth-token <sc_token>` is appended when a token is available, so authenticated requests avoid the anonymous 403s. `run_sync()` loads the token once via `load_scdl_token_noninteractive()` and passes it in.
+  - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks. The same pinned `--name-format` / `--playlist-name-format` / `--no-playlist-folder` flags as `download_scdl` are passed (see "SoundCloud filename scheme" below). `--auth-token <sc_token>` is appended when a token is available, so authenticated requests avoid the anonymous 403s. `run_sync()` loads the token once via `load_scdl_token_noninteractive()` and passes it in.
   - **youtube:** `download_ytdlp(url, output_path, archive_path=.archive.txt)` so already-fetched videos are skipped (additive only, no deletion).
-- **Counts come from the on-disk file diff:** `new = len(files_after - files_before)`, `removed = len(files_before - files_after)`, computed before renaming so renames do not inflate them. This works uniformly for all sources, including the incremental Spotify deletions. SoundCloud/YouTube new files are passed through `rename_files`; Spotify files are left as spotdl named them (so the cache/skip logic stays consistent). One concise `→ +N new / -N removed / up to date` line is printed per playlist.
+- **Counts come from the on-disk file diff:** `new = len(files_after - files_before)`, `removed = len(files_before - files_after)`, computed before renaming so renames do not inflate them. This works uniformly for all sources, including the incremental Spotify deletions. Only **YouTube** new files are passed through `rename_files`; Spotify files are left as spotdl named them and **SoundCloud files are left as scdl named them** (both are already in the desired `Title - Artist` form, and renaming would drift the on-disk name from the sync archive entry - see "SoundCloud filename scheme" below). One concise `→ +N new / -N removed / up to date` line is printed per playlist.
 - **Error capture.** For spotdl and scdl the command runs through `_run_and_capture()`, which attaches the child to a pseudo-terminal (`pty`) and tees its output. The pty is essential: spotdl/scdl detect a non-terminal stdout and strip colours, drop progress bars, and block-buffer, so a plain pipe would kill their live UI; the pty makes them believe they are on a real terminal, preserving colours, progress bars, and "retry will occur after Xs" countdowns in real time while every byte is still captured. (`_run_and_capture_pipe()` is a line-streamed fallback for platforms without `pty`.) `_parse_sync_errors()` strips ANSI codes and keeps only lines containing `SYNC_ERROR_KEYWORDS` (`error`, `failed`, `not found`); routine skips and retry countdowns are excluded. For youtube the yt-dlp logger's own error list is used. These feed the errors-only section of the summary.
 
 ---
@@ -353,6 +356,22 @@ incremental spotify sync
 ### `handle_duplicate_downloads(final_files, files_before)`
 - **Standalone only.** Builds a map of basename to existing paths from `files_before`, then for each newly downloaded file whose basename collides with an existing one, prompts: keep both, skip (delete the new copy), or replace (delete the old copy). Returns the surviving file list for the summary. Sync never calls this - its dedup is handled natively per engine and by the Rekordbox export.
 - `_safe_remove(path)` is a small best-effort `os.remove` wrapper used for the skip/replace deletions.
+
+### SoundCloud filename scheme (the `NNN.` duplicate bug)
+
+**Symptom.** A registered SoundCloud playlist of 323 tracks accumulated 506 MP3s - 183 tracks present twice under two different names.
+
+**Root cause.** scdl applies *different* default filename templates depending on how a URL is fetched:
+- single track / `download_scdl` (no `--sync`): `name_format = [%(id)s] %(uploader)s - %(title)s`
+- playlist / `--sync`: `playlist_name_format = %(playlist_index)s. %(uploader)s - %(title)s` - note the leading **`NNN.` playlist-position prefix**.
+
+So a track first pulled standalone, then synced (or vice-versa), landed on disk under two non-matching names. scdl's `--sync` archive keys dedup on the recorded path, so the second name looked brand-new and was downloaded again. The old `rename_files` call on the sync path made it worse: it renamed scdl's output using a *different* character-sanitization rule (stripping `\ / : * ? " < > |`) than scdl/yt-dlp's (which substitutes full-width glyphs like `，` `｜`), so even matched tracks could drift away from their archive entry and re-download on the next sync.
+
+**Fix (two parts).**
+1. **Pin the filename scheme** on *both* scdl call sites (`download_scdl` and `sync_one_playlist`'s soundcloud branch) with identical flags: `--name-format "{title} - {user[username]}"`, `--playlist-name-format "{title} - {user[username]}"` (kills the `NNN.` prefix and makes single/playlist names identical), and `--no-playlist-folder` (flat output, no nested playlist subfolder). scdl has no `{artist}` token; `{user[username]}` is the uploader, which scdl also writes to the ID3 artist tag, so the on-disk name matches the tags.
+2. **Skip `rename_files` for SoundCloud** in `sync_one_playlist` (the gate is now `source not in ("spotify", "soundcloud")`). scdl's pinned name is already authoritative and correct; renaming it would only re-introduce the sanitization drift that breaks `--sync` dedup. `rename_files` is unchanged and still runs for YouTube.
+
+**One-time library cleanup (historical context).** The fix prevents *new* duplicates but does not touch a library already polluted by the old behaviour. A one-off, untracked `cleanup.py` diagnostic script was used once to de-duplicate the existing `my-pendrive` folder down to its 323 unique tracks (keeping one file per `title + artist`) and reset the stale `.sync_archive`; it was deleted afterward and is intentionally **not** part of the repo.
 
 ---
 

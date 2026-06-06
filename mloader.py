@@ -610,6 +610,15 @@ def download_scdl(url, output_path, auth_token=None):
         "-l", url,
         "--path", output_path,
         "--onlymp3",
+        # Force a single, consistent filename scheme for single tracks AND playlist
+        # tracks. scdl's default playlist format adds a "NNN. " position prefix, which
+        # differs from the standalone format and breaks --sync dedup later. Both name
+        # formats are pinned identically here and in sync_one_playlist so a track keeps
+        # the same name however it was fetched. --no-playlist-folder keeps files flat in
+        # output_path instead of nesting them under a playlist-named subfolder.
+        "--name-format", "{title} - {user[username]}",
+        "--playlist-name-format", "{title} - {user[username]}",
+        "--no-playlist-folder",
     ]
     if auth_token:
         cmd += ["--auth-token", auth_token]
@@ -1139,6 +1148,12 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
             "--sync", archive,
             "--path", output_path,
             "--onlymp3",
+            # Same pinned filename scheme as download_scdl (see the comment there): no
+            # "NNN. " playlist-position prefix and no nested playlist subfolder, so names
+            # stay identical to a standalone fetch and scdl's --sync archive matches.
+            "--name-format", "{title} - {user[username]}",
+            "--playlist-name-format", "{title} - {user[username]}",
+            "--no-playlist-folder",
         ]
         if sc_token:
             cmd += ["--auth-token", sc_token]
@@ -1159,9 +1174,11 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
     result["new"] = len(new_files)
     result["removed"] = len(files_before - files_after)
     # Spotify files are already named by spotdl's template (see the spotify branch).
-    # Renaming them would break spotdl sync's "already downloaded" check and cause it to
-    # re-download the whole playlist next time, so only rename SoundCloud/YouTube files.
-    if new_files and source != "spotify":
+    # SoundCloud files are already named by scdl's pinned --name-format (see the
+    # soundcloud branch); rename_files uses a different character-sanitization path, so
+    # renaming would drift the on-disk name from scdl's --sync archive entry and break
+    # dedup on the next sync. Both are left as-is; only YouTube (yt-dlp) files are renamed.
+    if new_files and source not in ("spotify", "soundcloud"):
         rename_files(new_files)
     if result["errors"]:
         result["status"] = "error"

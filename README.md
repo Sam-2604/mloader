@@ -164,7 +164,7 @@ Beyond one-off downloads, mloader can keep playlists in sync: download new track
 
 **List saved playlists (option 9):** prints every registered playlist with its source, URL, and folder.
 
-**Sync all saved playlists (option 10):** runs every saved playlist through its engine's native sync, renames new files, then regenerates the Rekordbox XML. Each source syncs differently:
+**Sync all saved playlists (option 10):** runs every saved playlist through its engine's native sync, then regenerates the Rekordbox XML. New files already arrive named `Song Name - Artist` (each engine is configured to name them that way), so they import cleanly without a separate rename pass. Each source syncs differently:
 
 | Source | Sync behaviour |
 |---|---|
