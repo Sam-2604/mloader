@@ -887,11 +887,16 @@ def sync_one_playlist(entry, creds, sc_token=None):
             return []
         sync_file = os.path.expanduser(entry["sync_file"])
         os.makedirs(os.path.dirname(sync_file), exist_ok=True)
+        # Give spotdl an explicit filename template so it both writes AND looks for files
+        # under the same deterministic name on every run. spotdl sync decides what to skip
+        # by checking whether this exact path exists, so we must NOT rename these files
+        # afterwards (doing so made spotdl re-download the whole playlist each sync).
+        out_template = os.path.join(output_path, "{title} - {artist}.{output-ext}")
         if os.path.exists(sync_file):
             # Subsequent run: re-sync from the tracking file (adds new, removes deleted).
             cmd = _spotdl_base() + [
                 "sync", sync_file,
-                "--output", output_path,
+                "--output", out_template,
                 "--client-id", creds["client_id"],
                 "--client-secret", creds["client_secret"],
                 "--bitrate", "auto", "--no-cache",
@@ -901,7 +906,7 @@ def sync_one_playlist(entry, creds, sc_token=None):
             cmd = _spotdl_base() + [
                 "sync", url,
                 "--save-file", sync_file,
-                "--output", output_path,
+                "--output", out_template,
                 "--format", "mp3",
                 "--client-id", creds["client_id"],
                 "--client-secret", creds["client_secret"],
@@ -934,7 +939,10 @@ def sync_one_playlist(entry, creds, sc_token=None):
 
     files_after = get_all_mp3s(output_path)
     new_files = list(files_after - files_before)
-    if new_files:
+    # Spotify files are already named by spotdl's template (see the spotify branch).
+    # Renaming them would break spotdl sync's "already downloaded" check and cause it to
+    # re-download the whole playlist next time, so only rename SoundCloud/YouTube files.
+    if new_files and source != "spotify":
         rename_files(new_files)
     print(f"  ✓ {len(new_files)} new track(s).")
     return errors
