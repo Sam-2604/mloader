@@ -39,6 +39,7 @@ DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")
 # Playlist sync registry + spotdl per-playlist tracking files (all outside the repo).
 PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
 SYNC_DIR = os.path.expanduser("~/.config/mloader/sync")
+CACHE_DIR = os.path.expanduser("~/.config/mloader/cache")   # local Spotify tracklist cache
 REKORDBOX_XML = os.path.join(MLOADER_ROOT, "rekordbox.xml")
 
 # Sources that can be registered for syncing, mapped to their library sub-folder.
@@ -229,8 +230,10 @@ def check_disk_space(path):
 # ─────────────────────────────────────────────
 def validate_spotify_creds(client_id, client_secret):
     """
-    Hit Spotify's token endpoint with a client_credentials grant to confirm
-    the credentials work before saving them. Returns True if valid.
+    Hit Spotify's token endpoint with a client_credentials grant to confirm the
+    credentials work. Returns the access token string on success, or None on failure.
+    The token is truthy, so existing `if validate_spotify_creds(...)` checks still work,
+    and the cache-based sync reuses the returned token for direct Spotify API calls.
     Uses only stdlib (urllib) - no extra dependencies.
     """
     token_url = "https://accounts.spotify.com/api/token"
@@ -246,11 +249,13 @@ def validate_spotify_creds(client_id, client_secret):
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
+            if resp.status == 200:
+                return json.load(resp).get("access_token")
+            return None
     except urllib.error.HTTPError:
-        return False
+        return None
     except Exception:
-        return False
+        return None
 
 
 def get_spotdl_creds():
@@ -294,6 +299,73 @@ def reset_spotdl_creds():
         print("✅ Spotify credentials cleared. You will be prompted to re-enter them on the next Spotify download.")
     else:
         print("ℹ️  No saved credentials found.")
+
+
+# ─────────────────────────────────────────────
+# SPOTIFY PLAYLIST CACHE
+# ─────────────────────────────────────────────
+def extract_spotify_id(url):
+    """Pull the bare id out of a Spotify playlist URL or URI (open.spotify.com or spotify:)."""
+    m = re.search(r"playlist[/:]([A-Za-z0-9]+)", url)
+    return m.group(1) if m else None
+
+
+def fetch_spotify_playlist(playlist_url, creds):
+    """
+    Fetch a playlist's full tracklist directly from the Spotify Web API using stdlib urllib
+    (no spotipy). Gets a client-credentials token via validate_spotify_creds(), then pages
+    through every result via the response's `next` field. Returns a list of
+    {"id", "title", "artist"} dicts (primary artist; tracks without an id are skipped).
+    Raises RuntimeError/ValueError on auth or URL problems so callers can fall back.
+    """
+    token = validate_spotify_creds(creds["client_id"], creds["client_secret"])
+    if not token:
+        raise RuntimeError("Spotify rejected the credentials (could not get an access token).")
+    playlist_id = extract_spotify_id(playlist_url)
+    if not playlist_id:
+        raise ValueError(f"Could not parse a playlist id from: {playlist_url}")
+
+    tracks = []
+    next_url = (
+        f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+        "?fields=next,items(track(id,name,artists(name)))&limit=100"
+    )
+    while next_url:
+        req = urllib.request.Request(next_url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+        for item in data.get("items", []):
+            track = item.get("track") or {}
+            track_id = track.get("id")
+            if not track_id:
+                continue  # local files / unavailable tracks have no id
+            artists = track.get("artists") or []
+            tracks.append({
+                "id": track_id,
+                "title": track.get("name", ""),
+                "artist": artists[0]["name"] if artists else "",
+            })
+        next_url = data.get("next")
+    return tracks
+
+
+def load_playlist_cache(playlist_id):
+    """Return the cached tracklist for a playlist id, or [] if there is no cache yet."""
+    path = os.path.join(CACHE_DIR, f"{playlist_id}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_playlist_cache(playlist_id, tracks):
+    """Write the current tracklist to the playlist's cache file."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(os.path.join(CACHE_DIR, f"{playlist_id}.json"), "w") as f:
+        json.dump(tracks, f, indent=2)
 
 
 # ─────────────────────────────────────────────
@@ -649,13 +721,15 @@ def list_playlists():
 # ─────────────────────────────────────────────
 # SYNC
 # ─────────────────────────────────────────────
-def run_sync(entries=None):
+def run_sync(entries=None, force_full=False):
     """
     Sync registered playlists, then regenerate the Rekordbox XML. Has no prompts, so it
     backs menu option 10, the headless `--sync` flag, and the selective-sync paths.
 
     entries: the list of registry entries to sync. When None (the default), every saved
     playlist is synced - so `run_sync()` with no arguments behaves exactly as before.
+    force_full: bypass the Spotify metadata cache and run the original full spotdl sync
+    (the --force-full-sync flag).
     """
     check_dependencies()
     registry = load_registry()
@@ -672,27 +746,60 @@ def run_sync(entries=None):
     creds = load_creds_noninteractive()
     sc_token = load_scdl_token_noninteractive()
     print(f"\n🔄 Syncing {len(entries)} playlist(s)...")
-    sync_issues = {}   # playlist name -> list of notable lines
+    results = []
     for entry in entries:
         try:
-            errs = sync_one_playlist(entry, creds, sc_token)
-            if errs:
-                sync_issues[entry.get("name")] = errs
+            results.append(sync_one_playlist(entry, creds, sc_token, force_full=force_full))
         except Exception as e:
-            sync_issues[entry.get("name")] = [f"Critical error: {e}"]
-            print(f"❌ Error syncing '{entry.get('name')}': {e}")
+            print(f"  ❌ {entry.get('name')}: {e}")
+            results.append({"name": entry.get("name"), "source": entry.get("source"),
+                            "new": 0, "removed": 0, "errors": [f"Critical error: {e}"], "status": "error"})
 
     print("\n🎛️  Generating Rekordbox XML...")
     count = generate_rekordbox_xml()
-    print(f"✅ Rekordbox XML written to {REKORDBOX_XML} ({count} unique tracks).")
+    print(f"✅ Rekordbox XML written ({count} unique tracks)")
 
-    if sync_issues:
-        print("\n" + "-" * 40)
-        print("⚠️  Sync notices (errors / failed / skipped / not found)")
-        print("-" * 40)
-        for pname, errs in sync_issues.items():
-            print(f"\n[{pname}]")
-            for line in errs:
+    _print_sync_summary(results)
+
+
+def _print_sync_summary(results):
+    """Print one clean, scannable summary of a sync run: a status line per playlist, totals,
+    and an errors-only section. Routine skipped/up-to-date tracks are never itemised."""
+    width = max((len(r["name"]) for r in results), default=12)
+    tot_new = sum(r["new"] for r in results)
+    tot_removed = sum(r["removed"] for r in results)
+    tot_errors = sum(len(r["errors"]) for r in results)
+    changed = [r for r in results if r["new"] or r["removed"] or r["errors"]]
+
+    print("\n" + "=" * 56)
+    print("✅ Sync Summary")
+    print("=" * 56)
+    for r in results:
+        if r["status"].startswith("skipped"):
+            state = r["status"]
+        elif r["new"] or r["removed"]:
+            parts = []
+            if r["new"]:
+                parts.append(f"+{r['new']} new")
+            if r["removed"]:
+                parts.append(f"-{r['removed']} removed")
+            state = ", ".join(parts)
+        else:
+            state = "up to date"
+        flag = "⚠️ " if r["errors"] else "  "
+        suffix = f"   ({len(r['errors'])} error(s))" if r["errors"] else ""
+        print(f" {flag} {r['name']:<{width}}  {state}{suffix}")
+    print("-" * 56)
+    print(f"{len(changed)} of {len(results)} playlist(s) changed | "
+          f"{tot_new} new, {tot_removed} removed, {tot_errors} error(s)")
+    print("=" * 56)
+
+    errored = [r for r in results if r["errors"]]
+    if errored:
+        print("\n⚠️  Errors (only) - everything else succeeded:")
+        for r in errored:
+            print(f"\n[{r['name']}]")
+            for line in r["errors"]:
                 print(f"  - {line.replace('ERROR: ', '').strip()}")
 
 
@@ -734,12 +841,13 @@ def sync_specific_playlists():
     run_sync(entries=selected)
 
 
-def sync_playlists_by_name(names):
+def sync_playlists_by_name(names, force_full=False):
     """
     Headless helper for --sync-playlist / --sync-playlists. Resolves each given name to
     its registry entry (matching the slugified name, so "House Vibes" and "house-vibes"
     both work) and syncs the matches in order, then regenerates the XML via run_sync().
     A name can match more than one entry if the same playlist name exists on two sources.
+    force_full is forwarded to run_sync (the --force-full-sync flag).
     """
     registry = load_registry()
     if not registry:
@@ -760,12 +868,13 @@ def sync_playlists_by_name(names):
     if not selected:
         print("No matching playlists to sync.")
         return
-    run_sync(entries=selected)
+    run_sync(entries=selected, force_full=force_full)
 
 
 # Lines in spotdl/scdl output matching any of these (case-insensitive) are surfaced
-# individually in the sync summary, the same way yt-dlp's captured errors are.
-SYNC_ERROR_KEYWORDS = ("error", "failed", "skipped", "not found")
+# individually in the sync summary. Only genuine problems - NOT routine "skipped /
+# already downloaded" lines - so a 2000-track sync summary stays readable.
+SYNC_ERROR_KEYWORDS = ("error", "failed", "not found")
 
 
 def _run_and_capture(cmd):
@@ -833,11 +942,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 def _parse_sync_errors(text):
     """
-    Pull notable lines out of captured sync output - those containing any of
-    SYNC_ERROR_KEYWORDS (case-insensitive) - so they appear individually in the sync
-    summary. ANSI colour codes are stripped and exact duplicates collapsed for a clean
-    summary. Rate-limit retry countdowns ("retry will occur after Xs") are normal progress,
-    not errors, so they are explicitly excluded.
+    Pull genuine error lines out of captured sync output - those containing any of
+    SYNC_ERROR_KEYWORDS (case-insensitive). Routine "skipped / already downloaded" lines
+    are intentionally NOT collected (they only clutter a large sync summary). ANSI colour
+    codes are stripped and exact duplicates collapsed. Rate-limit retry countdowns
+    ("retry will occur after Xs") are normal progress, not errors, so they are excluded.
     """
     found = []
     seen = set()
@@ -855,20 +964,146 @@ def _parse_sync_errors(text):
     return found
 
 
-def sync_one_playlist(entry, creds, sc_token=None):
+def _norm(s):
+    return (s or "").strip().lower()
+
+
+def _index_mp3_tags(directory):
+    """Return [(path, norm_title, norm_artist)] for every mp3 under directory, read via ID3."""
+    index = []
+    for root, _, files in os.walk(directory):
+        for f in files:
+            if f.lower().endswith(".mp3"):
+                path = os.path.join(root, f)
+                try:
+                    tags = EasyID3(path)
+                    title = _norm((tags.get("title") or [None])[0])
+                    artist = _norm((tags.get("artist") or [None])[0])
+                except Exception:
+                    title = artist = ""
+                index.append((path, title, artist))
+    return index
+
+
+def _match_track_file(index, title, artist):
+    """Find an on-disk file matching a track by ID3 title (+ artist), like rename_files. None if absent."""
+    nt, na = _norm(title), _norm(artist)
+    for path, t, a in index:
+        if t == nt and (na == "" or na in a or a in na):
+            return path
+    return None
+
+
+def _track_ref(track_id):
+    """spotdl download argument for a track. The open.spotify.com URL is accepted by this
+    spotdl version (verified) and is equivalent to the spotify:track: URI."""
+    return f"https://open.spotify.com/track/{track_id}"
+
+
+def _spotify_incremental_sync(entry, creds, output_path):
+    """
+    Cache-based Spotify sync. Fetch the current tracklist from the Spotify API, diff it
+    against the local cache by track id, then: download only NEW tracks (individual spotdl
+    download calls, not a full sync), delete the files of REMOVED tracks, and refresh the
+    cache. This avoids spotdl re-walking the entire playlist (hundreds of API calls) on
+    every sync. Returns notable error lines. Per-playlist counts are reported by the caller
+    from the on-disk file diff, so this stays quiet apart from spotdl's own download output.
+    """
+    playlist_id = extract_spotify_id(entry["url"])
+    current = fetch_spotify_playlist(entry["url"], creds)
+    cache = load_playlist_cache(playlist_id)
+
+    cache_ids = {t["id"] for t in cache}
+    current_ids = {t["id"] for t in current}
+    new_tracks = [t for t in current if t["id"] not in cache_ids]
+    removed_tracks = [t for t in cache if t["id"] not in current_ids]
+
+    if not new_tracks and not removed_tracks:
+        return []
+
+    errors = []
+    if new_tracks:
+        out_template = os.path.join(output_path, "{title} - {artist}.{output-ext}")
+        cmd = _spotdl_base() + ["download"] + [_track_ref(t["id"]) for t in new_tracks] + [
+            "--format", "mp3",
+            "--output", out_template,
+            "--client-id", creds["client_id"],
+            "--client-secret", creds["client_secret"],
+            "--bitrate", "auto", "--no-cache",
+        ]
+        errors = _parse_sync_errors(_run_and_capture(cmd))
+
+    if removed_tracks:
+        index = _index_mp3_tags(output_path)
+        for t in removed_tracks:
+            path = _match_track_file(index, t["title"], t["artist"])
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    # Refresh the cache to the tracks actually present on disk, so any that failed to
+    # download are treated as new (and retried) on the next sync rather than marked done.
+    index = _index_mp3_tags(output_path)
+    present = [t for t in current if _match_track_file(index, t["title"], t["artist"])]
+    save_playlist_cache(playlist_id, present)
+    return errors
+
+
+def _spotify_full_sync(entry, creds, output_path):
+    """
+    Original spotdl-sync behaviour: run spotdl's own sync over the whole playlist. Used by
+    --force-full-sync and as a fallback when the cache-based path fails. Refreshes the local
+    cache afterwards so later incremental syncs have an accurate baseline.
+    """
+    sync_file = os.path.expanduser(entry["sync_file"])
+    os.makedirs(os.path.dirname(sync_file), exist_ok=True)
+    out_template = os.path.join(output_path, "{title} - {artist}.{output-ext}")
+    if os.path.exists(sync_file):
+        cmd = _spotdl_base() + [
+            "sync", sync_file, "--output", out_template,
+            "--client-id", creds["client_id"], "--client-secret", creds["client_secret"],
+            "--bitrate", "auto", "--no-cache",
+        ]
+    else:
+        cmd = _spotdl_base() + [
+            "sync", entry["url"], "--save-file", sync_file, "--output", out_template,
+            "--format", "mp3",
+            "--client-id", creds["client_id"], "--client-secret", creds["client_secret"],
+            "--bitrate", "auto", "--no-cache",
+        ]
+    errors = _parse_sync_errors(_run_and_capture(cmd))
+    try:
+        current = fetch_spotify_playlist(entry["url"], creds)
+        index = _index_mp3_tags(output_path)
+        present = [t for t in current if _match_track_file(index, t["title"], t["artist"])]
+        save_playlist_cache(extract_spotify_id(entry["url"]), present)
+    except Exception as e:
+        print(f"  ⚠️  Could not refresh cache after full sync: {e}")
+    return errors
+
+
+def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
     """
     Sync a single registered playlist with its source's native sync mechanism:
-      - spotify    : `spotdl sync` (handles new downloads AND deletions on its own)
+      - spotify    : cache-based incremental sync (download only NEW tracks, delete REMOVED
+                     ones); falls back to a full `spotdl sync` if the cache path fails, and
+                     uses the full sync directly when force_full is set
       - soundcloud : `scdl --sync` against a per-folder archive
       - youtube    : yt-dlp with a download-archive so existing tracks are skipped
-    New files are renamed to the standard 'Song - Artist.mp3' afterward.
+    SoundCloud/YouTube new files are renamed to 'Song - Artist.mp3'; Spotify files keep the
+    name spotdl gives them (so the cache/skip logic stays consistent).
 
     sc_token (optional): a SoundCloud OAuth token passed to scdl as --auth-token so it can
     download tracks that fail anonymously.
+    force_full (optional): bypass the Spotify metadata cache and run the original full
+    spotdl sync (the --force-full-sync flag).
 
-    Returns a list of notable lines (errors / failures / skips / not-found) so they show
-    up individually in the sync summary. For spotdl and scdl, output is teed to the
-    console live and captured, then scanned for SYNC_ERROR_KEYWORDS; for youtube the
+    Returns a result dict {name, source, new, removed, errors, status} so run_sync can print
+    one clean summary. `new`/`removed` come from the on-disk file diff; `errors` holds only
+    genuine error lines (routine skips are excluded). For spotdl and scdl, output is teed to
+    the console live and captured, then scanned for SYNC_ERROR_KEYWORDS; for youtube the
     yt-dlp logger's own error list is returned.
     """
     name = entry["name"]
@@ -876,43 +1111,24 @@ def sync_one_playlist(entry, creds, sc_token=None):
     url = entry["url"]
     output_path = os.path.expanduser(entry["output_path"])
     os.makedirs(output_path, exist_ok=True)
+    result = {"name": name, "source": source, "new": 0, "removed": 0, "errors": [], "status": "ok"}
 
     print(f"\n── {name} [{source}] ──")
     files_before = get_all_mp3s(output_path)
-    errors = []
 
     if source == "spotify":
         if not creds:
-            print("  ⏭️  Skipped: no Spotify credentials saved (run a Spotify download once to set them up).")
-            return []
-        sync_file = os.path.expanduser(entry["sync_file"])
-        os.makedirs(os.path.dirname(sync_file), exist_ok=True)
-        # Give spotdl an explicit filename template so it both writes AND looks for files
-        # under the same deterministic name on every run. spotdl sync decides what to skip
-        # by checking whether this exact path exists, so we must NOT rename these files
-        # afterwards (doing so made spotdl re-download the whole playlist each sync).
-        out_template = os.path.join(output_path, "{title} - {artist}.{output-ext}")
-        if os.path.exists(sync_file):
-            # Subsequent run: re-sync from the tracking file (adds new, removes deleted).
-            cmd = _spotdl_base() + [
-                "sync", sync_file,
-                "--output", out_template,
-                "--client-id", creds["client_id"],
-                "--client-secret", creds["client_secret"],
-                "--bitrate", "auto", "--no-cache",
-            ]
+            print("  ⏭️  skipped (no Spotify credentials)")
+            result["status"] = "skipped (no Spotify credentials)"
+            return result
+        if force_full:
+            result["errors"] = _spotify_full_sync(entry, creds, output_path)
         else:
-            # First run: download everything and create the tracking file.
-            cmd = _spotdl_base() + [
-                "sync", url,
-                "--save-file", sync_file,
-                "--output", out_template,
-                "--format", "mp3",
-                "--client-id", creds["client_id"],
-                "--client-secret", creds["client_secret"],
-                "--bitrate", "auto", "--no-cache",
-            ]
-        errors = _parse_sync_errors(_run_and_capture(cmd))
+            try:
+                result["errors"] = _spotify_incremental_sync(entry, creds, output_path)
+            except Exception as e:
+                print(f"  ⚠️  Cache-based sync failed ({e}); falling back to full spotdl sync.")
+                result["errors"] = _spotify_full_sync(entry, creds, output_path)
 
     elif source == "soundcloud":
         # scdl --sync compares the playlist against an archive db and downloads/removes
@@ -926,26 +1142,41 @@ def sync_one_playlist(entry, creds, sc_token=None):
         ]
         if sc_token:
             cmd += ["--auth-token", sc_token]
-        errors = _parse_sync_errors(_run_and_capture(cmd))
+        result["errors"] = _parse_sync_errors(_run_and_capture(cmd))
 
     elif source == "youtube":
         # A download-archive makes re-runs skip already-fetched videos.
         archive = os.path.join(output_path, ".archive.txt")
-        errors = download_ytdlp(url, output_path, archive_path=archive)
+        result["errors"] = download_ytdlp(url, output_path, archive_path=archive)
 
     else:
-        print(f"  ⏭️  Skipped: unknown source '{source}'.")
-        return [f"Unknown source '{source}'"]
+        print(f"  ⏭️  skipped (unknown source '{source}')")
+        result["status"] = "skipped (unknown source)"
+        return result
 
     files_after = get_all_mp3s(output_path)
     new_files = list(files_after - files_before)
+    result["new"] = len(new_files)
+    result["removed"] = len(files_before - files_after)
     # Spotify files are already named by spotdl's template (see the spotify branch).
     # Renaming them would break spotdl sync's "already downloaded" check and cause it to
     # re-download the whole playlist next time, so only rename SoundCloud/YouTube files.
     if new_files and source != "spotify":
         rename_files(new_files)
-    print(f"  ✓ {len(new_files)} new track(s).")
-    return errors
+    if result["errors"]:
+        result["status"] = "error"
+
+    # One concise per-playlist line; the full breakdown is in run_sync's summary.
+    bits = []
+    if result["new"]:
+        bits.append(f"+{result['new']} new")
+    if result["removed"]:
+        bits.append(f"-{result['removed']} removed")
+    line = ", ".join(bits) if bits else "up to date"
+    if result["errors"]:
+        line += f"  ⚠️  {len(result['errors'])} error(s)"
+    print(f"  → {line}")
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -1234,16 +1465,22 @@ if __name__ == "__main__":
         help="Headless mode: sync several saved playlists by name (comma-separated), then exit. "
              "Example: python mloader.py --sync-playlists english,hindi-party,edm",
     )
+    parser.add_argument(
+        "--force-full-sync",
+        action="store_true",
+        help="With a sync flag: bypass the local Spotify metadata cache and run the original "
+             "full spotdl sync. Use if the cache is corrupted or to force a clean re-sync.",
+    )
     args = parser.parse_args()
 
     try:
         if args.sync:
-            run_sync()
+            run_sync(force_full=args.force_full_sync)
         elif args.sync_playlist:
-            sync_playlists_by_name([args.sync_playlist])
+            sync_playlists_by_name([args.sync_playlist], force_full=args.force_full_sync)
         elif args.sync_playlists:
             names = [n.strip() for n in args.sync_playlists.split(",") if n.strip()]
-            sync_playlists_by_name(names)
+            sync_playlists_by_name(names, force_full=args.force_full_sync)
         else:
             main()
     except KeyboardInterrupt:

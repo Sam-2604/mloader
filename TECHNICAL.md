@@ -19,8 +19,10 @@ External config + state written at runtime (all outside the repo):
 ├── spotdl_creds.json       # Spotify Developer API credentials (first Spotify download)
 ├── soundcloud_creds.json   # SoundCloud OAuth token (first SoundCloud download/sync)
 ├── playlists.json      # Saved-playlist registry for syncing
-└── sync/
-    └── <slug>.spotdl   # spotdl per-playlist tracking file (Spotify only)
+├── sync/
+│   └── <slug>.spotdl   # spotdl per-playlist tracking file (Spotify full-sync fallback)
+└── cache/
+    └── <playlist-id>.json   # cached Spotify tracklist for incremental syncs
 ```
 
 spotdl also keeps its own config and token cache (created/managed by spotdl, not mloader):
@@ -47,6 +49,7 @@ mloader has two entry behaviours, selected by `argparse` in the `__main__` block
 - **Interactive (default):** `python mloader.py` runs `main()`, the menu loop.
 - **Headless sync (all):** `python mloader.py --sync` runs `run_sync()` once and exits - no menu, no prompts. This is what the weekly `launchd` automation calls.
 - **Headless sync (specific):** `--sync-playlist <name>` syncs one saved playlist by name; `--sync-playlists <name1,name2,...>` syncs several. Both resolve names via `sync_playlists_by_name()` and exit. The flags are mutually exclusive in practice (checked in priority order: `--sync`, then `--sync-playlist`, then `--sync-playlists`, else interactive).
+- **`--force-full-sync`:** a modifier for any of the sync flags. It bypasses the Spotify metadata cache and runs the original full `spotdl sync` (see "Spotify metadata cache"). Use it to recover from a corrupted cache or to force a clean re-sync.
 
 ---
 
@@ -87,6 +90,7 @@ MLOADER_ROOT = os.path.expanduser("~/Music/mloader")          # managed library 
 DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")        # default for standalone downloads
 PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
 SYNC_DIR = os.path.expanduser("~/.config/mloader/sync")       # spotdl .spotdl tracking files
+CACHE_DIR = os.path.expanduser("~/.config/mloader/cache")     # cached Spotify tracklists
 REKORDBOX_XML = os.path.join(MLOADER_ROOT, "rekordbox.xml")
 SYNC_SOURCES = {"spotify": "spotify", "soundcloud": "soundcloud", "youtube": "youtube"}
 DISK_WARN_THRESHOLD_GB = 1.0
@@ -118,16 +122,16 @@ DISK_WARN_THRESHOLD_GB = 1.0
 ---
 
 ### `validate_spotify_creds(client_id, client_secret)`
-- **Purpose:** Test a Client ID and Secret against Spotify's live API before saving them, so the user gets immediate feedback if they mistyped.
+- **Purpose:** Test a Client ID and Secret against Spotify's live API, and return the access token for reuse.
 - **Input:** Two strings - Client ID and Client Secret.
-- **Output:** `True` if Spotify accepted the credentials, `False` otherwise.
+- **Output:** The **access token string** on success, or `None` on failure. (The token is truthy, so existing `if validate_spotify_creds(...)` checks still behave the same; the cache-based sync reuses the returned token for direct API calls.)
 - **How it works:**
   - Combines credentials as `client_id:client_secret`, Base64-encodes the string
   - Makes a POST request to `https://accounts.spotify.com/api/token` with `grant_type=client_credentials`
   - This is Spotify's standard machine-to-machine auth flow - it doesn't require a user login, just a valid Developer app
-  - Returns `True` if the response status is 200
-- **Why stdlib only:** Uses `urllib.request`, `urllib.parse`, and `base64`, all built into Python. No additional packages needed for this validation step.
-- **Edge cases:** `urllib.error.HTTPError` (e.g. 401 Unauthorized) returns `False`. Any other exception (network timeout, DNS failure) also returns `False` - the `except Exception` catches this without crashing.
+  - On HTTP 200, parses the JSON and returns `access_token`; otherwise returns `None`
+- **Why stdlib only:** Uses `urllib.request`, `urllib.parse`, and `base64`, all built into Python. No additional packages needed.
+- **Edge cases:** `urllib.error.HTTPError` (e.g. 401 Unauthorized) returns `None`. Any other exception (network timeout, DNS failure) also returns `None` - caught without crashing.
 
 ---
 
@@ -287,9 +291,11 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 ### `list_playlists()` (menu option 9)
 - Prints every registered playlist with its source, URL, and folder.
 
-### `run_sync(entries=None)` (menu option 10 and `--sync`)
+### `run_sync(entries=None, force_full=False)` (menu option 10 and `--sync`)
 - Verifies dependencies, loads the registry, syncs each playlist via `sync_one_playlist()`, then calls `generate_rekordbox_xml()`. No prompts, so it backs the menu option, the headless flags, and the selective-sync paths. Each playlist sync is wrapped in try/except so one failure does not abort the rest.
 - **`entries`:** the subset of registry entries to sync. When `None` (default) it syncs the whole registry, so `run_sync()` with no arguments behaves exactly as the original did. Selective callers pass a pre-filtered, ordered list.
+- **`force_full`:** forwarded to each `sync_one_playlist`; bypasses the Spotify cache and runs a full spotdl sync (the `--force-full-sync` flag).
+- **Summary:** collects a result dict per playlist and hands them to `_print_sync_summary()`, which prints one scannable status line per playlist (`+N new` / `-N removed` / `up to date` / `skipped`), a totals line, and an **errors-only** section. Routine skipped/already-downloaded tracks are never itemised, so a 2000-track sync stays readable.
 
 ### `sync_specific_playlists()` (menu option 11)
 - Prints the registry numbered, reads a comma-separated list of numbers (e.g. `1,3,5`), validates each (ignoring out-of-range or non-numeric tokens with a warning), builds the selected entries in the order typed (de-duping repeats), and calls `run_sync(entries=selected)`.
@@ -297,13 +303,48 @@ The problem: YouTube Music regularly returns nothing for that bare one-character
 ### `sync_playlists_by_name(names)` (headless `--sync-playlist` / `--sync-playlists`)
 - Resolves each requested name to a registry entry by comparing `slugify(name)` against the stored slug, so `"House Vibes"` and `"house-vibes"` both match. Unmatched names print a warning and are skipped; a name can match more than one entry if the same playlist name exists on two sources. Calls `run_sync(entries=selected)` with the matches in order.
 
-### `sync_one_playlist(entry, creds, sc_token=None)`
-- Runs the source-appropriate native sync, then renames any new files:
-  - **spotify:** `spotdl sync` via `_spotdl_base()` (the shim). First run (no `.spotdl` file yet) downloads everything and writes the tracking file with `--save-file`; later runs sync from the tracking file, which adds new tracks **and deletes tracks removed from the playlist**. Skipped with a message if no credentials are available. spotdl is given an explicit `--output "{title} - {artist}.{output-ext}"` template so it writes and looks for each file under the same deterministic name; **these files are deliberately NOT renamed afterwards**, because spotdl sync decides what to skip by checking that exact path - renaming them (as earlier versions did) made spotdl re-download the entire playlist every sync.
+### `sync_one_playlist(entry, creds, sc_token=None, force_full=False)`
+- Runs the source-appropriate sync and returns a result dict `{name, source, new, removed, errors, status}`:
+  - **spotify:** cache-based incremental sync by default (`_spotify_incremental_sync`); see "Spotify metadata cache" below. With `force_full=True`, or if the incremental path raises, it falls back to `_spotify_full_sync` (the original `spotdl sync`). Skipped (no work) if no credentials are saved.
   - **soundcloud:** `scdl --sync <archive>` where the archive is `.sync_archive` inside the playlist folder; scdl adds/removes changed tracks. `--auth-token <sc_token>` is appended when a token is available, so authenticated requests avoid the anonymous 403s. `run_sync()` loads the token once via `load_scdl_token_noninteractive()` and passes it in.
   - **youtube:** `download_ytdlp(url, output_path, archive_path=.archive.txt)` so already-fetched videos are skipped (additive only, no deletion).
-- New files are detected with the same before/after `get_all_mp3s` diff used by standalone downloads. SoundCloud/YouTube new files are passed through `rename_files`; Spotify files are left as spotdl named them (see above).
-- **Returns notable lines.** For spotdl and scdl the command is run through `_run_and_capture()`, which attaches the child to a pseudo-terminal (`pty`) and tees its output. The pty is essential: spotdl/scdl detect a non-terminal stdout and strip colours, drop progress bars, and block-buffer, so a plain pipe would kill their live UI; the pty makes them believe they are on a real terminal, preserving colours, progress bars, and "retry will occur after Xs" countdowns in real time while every byte is still captured. (`_run_and_capture_pipe()` is a line-streamed fallback for platforms without `pty`, e.g. Windows.) `_parse_sync_errors()` then strips ANSI codes and extracts lines containing any of `SYNC_ERROR_KEYWORDS` (`error`, `failed`, `skipped`, `not found`, case-insensitive, de-duplicated), explicitly excluding rate-limit retry countdowns. For youtube the yt-dlp logger's own error list is returned. `run_sync()` collects these per playlist and prints them in a "Sync notices" summary, the same way standalone yt-dlp errors are surfaced.
+- **Counts come from the on-disk file diff:** `new = len(files_after - files_before)`, `removed = len(files_before - files_after)`, computed before renaming so renames do not inflate them. This works uniformly for all sources, including the incremental Spotify deletions. SoundCloud/YouTube new files are passed through `rename_files`; Spotify files are left as spotdl named them (so the cache/skip logic stays consistent). One concise `→ +N new / -N removed / up to date` line is printed per playlist.
+- **Error capture.** For spotdl and scdl the command runs through `_run_and_capture()`, which attaches the child to a pseudo-terminal (`pty`) and tees its output. The pty is essential: spotdl/scdl detect a non-terminal stdout and strip colours, drop progress bars, and block-buffer, so a plain pipe would kill their live UI; the pty makes them believe they are on a real terminal, preserving colours, progress bars, and "retry will occur after Xs" countdowns in real time while every byte is still captured. (`_run_and_capture_pipe()` is a line-streamed fallback for platforms without `pty`.) `_parse_sync_errors()` strips ANSI codes and keeps only lines containing `SYNC_ERROR_KEYWORDS` (`error`, `failed`, `not found`); routine skips and retry countdowns are excluded. For youtube the yt-dlp logger's own error list is used. These feed the errors-only section of the summary.
+
+---
+
+## Spotify Metadata Cache
+
+The default Spotify sync is **incremental and cache-based**, so a routine sync of 20+ playlists makes a handful of lightweight metadata calls instead of having spotdl re-walk every playlist (thousands of API calls) on each run.
+
+**The idea:** keep a local copy of each playlist's tracklist. On the next sync, fetch the current tracklist, diff it against the cache by Spotify track id, and only act on the difference - download the genuinely new tracks, delete the files of removed ones.
+
+**Storage:** `~/.config/mloader/cache/<playlist-id>.json` - a list of `{"id", "title", "artist"}` dicts. Ignored by git.
+
+**Functions:**
+- `extract_spotify_id(url)` - pulls the bare id from a playlist URL or `spotify:` URI.
+- `fetch_spotify_playlist(playlist_url, creds)` - fetches the full current tracklist straight from the Spotify Web API with stdlib `urllib` (no spotipy). Gets a token from `validate_spotify_creds()`, then pages through `/v1/playlists/{id}/tracks` following the response's `next` field until done. Returns `{id, title, artist}` per track (primary artist; tracks with no id, e.g. local files, are skipped). Raises on auth/URL problems so the caller can fall back to a full sync.
+- `load_playlist_cache(playlist_id)` / `save_playlist_cache(playlist_id, tracks)` - read/write the cache file (`[]` if none yet).
+- `_spotify_incremental_sync(entry, creds, output_path)` - the diff engine: fetch current, load cache, compute `new = current - cache` and `removed = cache - current` by id. Downloads new tracks with **one** `spotdl download <url> <url> ...` call (individual track URLs, the `_track_ref()` form, with the `{title} - {artist}` output template), deletes removed tracks' files (matched by ID3 tags via `_index_mp3_tags` / `_match_track_file`), then **rewrites the cache to only the tracks actually present on disk** - so a track that failed to download is treated as new and retried next time rather than being silently marked done.
+- `_spotify_full_sync(entry, creds, output_path)` - the original `spotdl sync` over the whole playlist, used by `--force-full-sync` and as the fallback. Refreshes the cache afterwards so later incremental syncs have an accurate baseline.
+
+**First run / migration note:** an empty cache means every current track counts as "new", so the first incremental sync issues a download for all of them - but spotdl skips any whose file already exists (overwrite=skip), so nothing is re-downloaded, only genuinely missing tracks are fetched, and the cache is populated for fast subsequent syncs.
+
+```
+incremental spotify sync
+  fetch_spotify_playlist() ── current tracklist (Spotify API, paginated)
+  load_playlist_cache()    ── last-known tracklist
+        │
+        ▼  diff by track id
+  new = current - cache        removed = cache - current
+        │                           │
+        ▼                           ▼
+  spotdl download <urls...>    delete matched files (ID3)
+        │                           │
+        └─────────────┬─────────────┘
+                      ▼
+        save_playlist_cache(tracks present on disk)
+```
 
 ---
 

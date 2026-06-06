@@ -18,6 +18,7 @@ FEEDBACK.md
 # but these patterns guard against them ever landing inside it.
 spotdl_creds.json
 soundcloud_creds.json
+cache/
 playlists.json
 *.spotdl
 .archive.txt
