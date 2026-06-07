@@ -177,13 +177,24 @@ Beyond one-off downloads, mloader can keep playlists in sync: download new track
 
 | Source | Sync behaviour |
 |---|---|
-| Spotify | `spotdl sync` - downloads new tracks **and deletes tracks removed from the playlist** |
+| Spotify | cache-based incremental sync (see below) - downloads new tracks **and deletes tracks removed from the playlist** |
 | SoundCloud | `scdl --sync` against a per-folder archive - adds and removes changed tracks |
 | YouTube | yt-dlp with a download-archive - skips already-downloaded tracks (does not delete) |
 
-> Spotify is the only source that deletes removed tracks from disk, because spotdl's sync file tracks the full playlist state. SoundCloud does this too via its archive. YouTube only adds.
+> Spotify and SoundCloud both delete tracks removed from the source playlist; YouTube only adds.
 
-Each engine's output is shown live during the sync and also captured, so any notable lines (errors, failures, skips, not-found) are collected and listed per playlist in a "Sync notices" summary at the end - the same way one-off download errors are reported.
+**Spotify sync is incremental and cached by default.** Rather than asking spotdl to re-walk every saved Spotify playlist on every run (slow and API-heavy once you have many playlists), mloader keeps a small local cache of each playlist's tracklist (`~/.config/mloader/cache/<playlist-id>.json`), diffs the current tracklist against it, and acts only on the difference: it downloads the genuinely new tracks and deletes the genuinely removed ones, then updates the cache to match what's on disk. The first sync of a playlist has no cache yet, so everything looks "new" - but spotdl skips any track whose file already exists, so nothing already downloaded gets pulled twice.
+
+If a cache ever looks wrong, or you just want to force the original full-sync behaviour, pass `--force-full-sync` alongside any sync flag:
+
+```bash
+python mloader.py --sync --force-full-sync
+python mloader.py --sync-playlist house-vibes --force-full-sync
+```
+
+This bypasses the cache, runs the original full `spotdl sync` for Spotify playlists, and rebuilds the cache afterward from the result.
+
+Each engine's output is shown live during the sync and also captured, so any notable lines (errors, failures, skips, not-found) are collected and listed per playlist in an errors-only "Sync notices" summary at the end - routine skips and already-downloaded tracks are never itemised, so even a sync of thousands of tracks stays readable.
 
 **Sync specific playlists (option 11):** when you do not want to sync everything, this lists your saved playlists with a number next to each. Type a comma-separated list (e.g. `1,3,5`) and only those are synced, in the order you typed. The Rekordbox XML is regenerated at the end as usual.
 
@@ -197,7 +208,7 @@ python mloader.py --sync-playlist house-vibes         # one, by registered name
 python mloader.py --sync-playlists english,hindi-party,edm   # several, by name
 ```
 
-Names are matched against the saved (slugified) playlist name, so `house-vibes` and `House Vibes` both resolve to the same playlist. For long-running syncs, prefix with `caffeinate -i` on macOS to stop the Mac sleeping mid-run:
+Names are matched against the saved (slugified) playlist name, so `house-vibes` and `House Vibes` both resolve to the same playlist. Add `--force-full-sync` to any of these to bypass the Spotify cache and run a full sync instead (see "Spotify sync is incremental and cached by default" above). For long-running syncs, prefix with `caffeinate -i` on macOS to stop the Mac sleeping mid-run:
 
 ```bash
 caffeinate -i python mloader.py --sync-playlist house-vibes

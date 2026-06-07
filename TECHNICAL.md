@@ -74,7 +74,8 @@ main()                              run_sync()  (also via --sync)
         ├── 10   run_sync()                 (all)
         ├── 11   sync_specific_playlists()  (pick by number)
         ├── 12   reset_spotdl_creds()
-        └── 13   reset_scdl_creds()
+        ├── 13   reset_scdl_creds()
+        └── 14   toggle_mixxx_analysis()
 ```
 
 Standalone downloads carry no in-memory state between iterations. Sync state lives on disk: the registry (`playlists.json`), spotdl's per-playlist `.spotdl` files, scdl's `.sync_archive`, and yt-dlp's `.archive.txt`.
@@ -374,6 +375,8 @@ So a track first pulled standalone, then synced (or vice-versa), landed on disk 
 2. **Skip `rename_files` for SoundCloud** in `sync_one_playlist` (the gate is now `source not in ("spotify", "soundcloud")`). scdl's pinned name is already authoritative and correct; renaming it would only re-introduce the sanitization drift that breaks `--sync` dedup. `rename_files` is unchanged and still runs for YouTube.
 
 **One-time library cleanup (historical context).** The fix prevents *new* duplicates but does not touch a library already polluted by the old behaviour. A one-off, untracked `cleanup.py` diagnostic script was used once to de-duplicate the existing `my-pendrive` folder down to its 323 unique tracks (keeping one file per `title + artist`) and reset the stale `.sync_archive`; it was deleted afterward and is intentionally **not** part of the repo.
+
+**Residual caveat.** The cleanup pass kept one file per `title + artist`, but it could not retroactively rename survivors to the new pinned scheme - 139 of the 323 tracks remained on disk under their old *unnumbered* (standalone-style) name rather than the `playlist_index`-prefixed name the pre-fix `--sync` archive expected. Because the archive now keys on the pinned name format going forward, those 139 will read as "missing" on the next sync and be re-downloaded once under the corrected name - functionally a one-time, self-resolving top-up rather than a bug. After that single re-sync, every file on disk and every archive entry will agree on the same naming scheme.
 
 ---
 
