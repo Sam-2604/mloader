@@ -21,8 +21,10 @@ External config + state written at runtime (all outside the repo):
 ├── playlists.json      # Saved-playlist registry for syncing
 ├── sync/
 │   └── <slug>.spotdl   # spotdl per-playlist tracking file (Spotify full-sync fallback)
-└── cache/
-    └── <playlist-id>.json   # cached Spotify tracklist for incremental syncs
+├── cache/
+│   └── <playlist-id>.json   # cached Spotify tracklist for incremental syncs
+└── dead/
+    └── <playlist-id>.json   # per-playlist dead-track skip-list (see Dead-track isolation)
 ```
 
 spotdl also keeps its own config and token cache (created/managed by spotdl, not mloader):
@@ -325,13 +327,13 @@ The default Spotify sync is **incremental and cache-based**, so a routine sync o
 
 **The idea:** keep a local copy of each playlist's tracklist. On the next sync, fetch the current tracklist, diff it against the cache by Spotify track id, and only act on the difference - download the genuinely new tracks, delete the files of removed ones.
 
-**Storage:** `~/.config/mloader/cache/<playlist-id>.json` - a list of `{"id", "title", "artist"}` dicts. Ignored by git.
+**Storage:** `~/.config/mloader/cache/<playlist-id>.json` - a list of `{"id", "title", "artist", "duration_ms"}` dicts. Ignored by git.
 
 **Functions:**
 - `extract_spotify_id(url)` - pulls the bare id from a playlist URL or `spotify:` URI.
-- `fetch_spotify_playlist(playlist_url, creds)` - fetches the full current tracklist straight from the Spotify Web API with stdlib `urllib` (no spotipy). Gets a token from `validate_spotify_creds()`, then pages through `/v1/playlists/{id}/tracks` following the response's `next` field until done. Returns `{id, title, artist}` per track (primary artist; tracks with no id, e.g. local files, are skipped). Raises on auth/URL problems so the caller can fall back to a full sync.
+- `fetch_spotify_playlist(playlist_url, creds)` - fetches the full current tracklist straight from the Spotify Web API with stdlib `urllib` (no spotipy). Gets a token from `validate_spotify_creds()`, then pages through `/v1/playlists/{id}/tracks` following the response's `next` field until done. Returns `{id, title, artist, duration_ms}` per track (primary artist; tracks with no id, e.g. local files, are skipped). `duration_ms` is fetched so the sync path can detect dead tracks (see "Dead-track isolation" below). Raises on auth/URL problems so the caller can fall back to a full sync.
 - `load_playlist_cache(playlist_id)` / `save_playlist_cache(playlist_id, tracks)` - read/write the cache file (`[]` if none yet).
-- `_spotify_incremental_sync(entry, creds, output_path)` - the diff engine: fetch current, load cache, compute `new = current - cache` and `removed = cache - current` by id. Downloads new tracks with **one** `spotdl download <url> <url> ...` call (individual track URLs, the `_track_ref()` form, with the `{title} - {artist}` output template), deletes removed tracks' files (matched by ID3 tags via `_index_mp3_tags` / `_match_track_file`), then **rewrites the cache to only the tracks actually present on disk** - so a track that failed to download is treated as new and retried next time rather than being silently marked done.
+- `_spotify_incremental_sync(entry, creds, output_path, result=None)` - the diff engine: fetch current, load cache, drop dead tracks (see below), compute `new = current - cache - dead` and `removed = cache - current` by id. Downloads new tracks with **one** `spotdl download <url> <url> ...` call (individual track URLs, the `_track_ref()` form, with the `{title} - {artist}` output template), deletes removed tracks' files (matched by ID3 tags via `_index_mp3_tags` / `_match_track_file`), then **rewrites the cache to only the tracks actually present on disk** - so a track that failed to download is treated as new and retried next time rather than being silently marked done.
 - `_spotify_full_sync(entry, creds, output_path)` - the original `spotdl sync` over the whole playlist, used by `--force-full-sync` and as the fallback. Refreshes the cache afterwards so later incremental syncs have an accurate baseline.
 
 **First run / migration note:** an empty cache means every current track counts as "new", so the first incremental sync issues a download for all of them - but spotdl skips any whose file already exists (overwrite=skip), so nothing is re-downloaded, only genuinely missing tracks are fetched, and the cache is populated for fast subsequent syncs.
@@ -351,6 +353,21 @@ incremental spotify sync
                       ▼
         save_playlist_cache(tracks present on disk)
 ```
+
+### Dead-track isolation (the spotdl batch-fail fix)
+
+**The problem.** The incremental sync hands all new tracks to spotdl in a single batch: one `spotdl download <url1> <url2> ...` call. Internally spotdl resolves that batch through `get_simple_songs`, which raises `SongError` on any track whose Spotify metadata is dead - `duration_ms == 0` or an empty name. These are tracks Spotify has delisted, region-locked, or removed: they still appear in the playlist but have no downloadable audio. Crucially, one such `SongError` aborts resolution for the **entire batch**, not just the bad track. So a playlist that has picked up a handful of dead tracks alongside genuinely new ones would report "N error(s)" and download **zero** new tracks, silently masking every legitimate addition. This was hit in practice on the `hindi-party` playlist: dead tracks in the batch, real new tracks not downloaded.
+
+**Why the fix lives in mloader, not spotdl.** mloader drives spotdl as a CLI subprocess, and spotdl's batch/sync mode has no per-track isolation to opt into. The fix therefore happens **before** spotdl runs, using the playlist metadata mloader already fetches from the Spotify Web API.
+
+**The mechanism.**
+- `fetch_spotify_playlist()` now also returns `duration_ms` for each track.
+- `_is_dead_track(track)` flags a track as dead when `duration_ms == 0` or its name is empty - exactly the conditions that make spotdl's `get_simple_songs` raise.
+- `_spotify_incremental_sync()` detects dead tracks in the current playlist, drops them from the download batch, and logs each one (title if any, track id, reason) so spotdl only ever sees downloadable URLs. One dead track can no longer block the rest of the playlist.
+
+**The skip-list (why dead tracks are not retried forever).** The cache is rewritten to only the tracks present on disk, so anything that failed to download is retried next sync. A dead track can never download, so on its own it would look "new" on every future sync - re-logged and, worse, re-added to the batch each run. To prevent that, dead tracks are persisted to a per-playlist skip-list at `~/.config/mloader/dead/<playlist-id>.json` (a list of `{"id", "title", "reason"}`, ignored by git). `load_dead_tracks` / `save_dead_tracks` read and write it. A dead track is logged only the first time it is seen (newly discovered ones), then permanently excluded from the new-track batch. Periodic re-checking (in case Spotify restores a track) is out of scope; skip-permanent is the current behavior. To force a re-check, delete the playlist's file under `~/.config/mloader/dead/`.
+
+**Summary reporting.** Dead tracks are counted separately from download errors. `result["dead"]` carries the count of dead tracks currently in the playlist, shown in the per-playlist line and totals as "N unavailable" (with a one-line footnote explaining it), distinct from genuine download failures (network, ffmpeg) which still appear under "error(s)". So the summary now distinguishes three outcomes: new tracks downloaded, tracks skipped as unavailable (informational, not a bug), and tracks that failed to download for other reasons.
 
 ---
 

@@ -40,6 +40,7 @@ DEFAULT_OUTPUT = os.path.expanduser("~/Music/mloader")
 PLAYLISTS_PATH = os.path.expanduser("~/.config/mloader/playlists.json")
 SYNC_DIR = os.path.expanduser("~/.config/mloader/sync")
 CACHE_DIR = os.path.expanduser("~/.config/mloader/cache")   # local Spotify tracklist cache
+DEAD_DIR = os.path.expanduser("~/.config/mloader/dead")     # per-playlist dead-track skip-lists
 CONFIG_PATH = os.path.expanduser("~/.config/mloader/config.json")  # general settings (e.g. mixxx_enabled)
 REKORDBOX_XML = os.path.join(MLOADER_ROOT, "rekordbox.xml")
 
@@ -329,6 +330,11 @@ def fetch_spotify_playlist(playlist_url, creds):
     through every result via the response's `next` field. Returns a list of
     {"id", "title", "artist"} dicts (primary artist; tracks without an id are skipped).
     Raises RuntimeError/ValueError on auth or URL problems so callers can fall back.
+
+    duration_ms is fetched alongside id/name/artist so the sync path can detect "dead"
+    tracks (zero duration or empty name - delisted/region-locked/removed) BEFORE handing
+    them to spotdl, which would otherwise raise SongError on them (see the dead-track
+    isolation in _spotify_incremental_sync).
     """
     token = validate_spotify_creds(creds["client_id"], creds["client_secret"])
     if not token:
@@ -340,7 +346,7 @@ def fetch_spotify_playlist(playlist_url, creds):
     tracks = []
     next_url = (
         f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
-        "?fields=next,items(track(id,name,artists(name)))&limit=100"
+        "?fields=next,items(track(id,name,duration_ms,artists(name)))&limit=100"
     )
     while next_url:
         req = urllib.request.Request(next_url, headers={"Authorization": f"Bearer {token}"})
@@ -356,6 +362,7 @@ def fetch_spotify_playlist(playlist_url, creds):
                 "id": track_id,
                 "title": track.get("name", ""),
                 "artist": artists[0]["name"] if artists else "",
+                "duration_ms": track.get("duration_ms") or 0,
             })
         next_url = data.get("next")
     return tracks
@@ -378,6 +385,41 @@ def save_playlist_cache(playlist_id, tracks):
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(os.path.join(CACHE_DIR, f"{playlist_id}.json"), "w") as f:
         json.dump(tracks, f, indent=2)
+
+
+def _is_dead_track(track):
+    """
+    True if a Spotify track cannot be downloaded because its metadata is dead: zero
+    duration_ms or an empty name. These are delisted, region-locked, or removed tracks;
+    spotdl's get_simple_songs raises SongError on exactly these, which aborts resolution
+    for the whole batch (see _spotify_incremental_sync). We detect and skip them first.
+    """
+    return (track.get("duration_ms") or 0) == 0 or not (track.get("title") or "").strip()
+
+
+def load_dead_tracks(playlist_id):
+    """
+    Return the persisted dead-track skip-list for a playlist as a list of
+    {"id", "title", "reason"} dicts (empty list if none yet). Dead tracks are recorded
+    once so they are logged a single time and never re-attempted on every future sync
+    (they can never download, so without this they would look "new" forever and re-break
+    the batch each run).
+    """
+    path = os.path.join(DEAD_DIR, f"{playlist_id}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_dead_tracks(playlist_id, dead):
+    """Write the dead-track skip-list back to the playlist's dead_tracks file."""
+    os.makedirs(DEAD_DIR, exist_ok=True)
+    with open(os.path.join(DEAD_DIR, f"{playlist_id}.json"), "w") as f:
+        json.dump(dead, f, indent=2)
 
 
 # ─────────────────────────────────────────────
@@ -885,7 +927,7 @@ def run_sync(entries=None, force_full=False):
         except Exception as e:
             print(f"  ❌ {entry.get('name')}: {e}")
             results.append({"name": entry.get("name"), "source": entry.get("source"),
-                            "new": 0, "removed": 0, "new_paths": [],
+                            "new": 0, "removed": 0, "dead": 0, "new_paths": [],
                             "errors": [f"Critical error: {e}"], "status": "error"})
 
     # Analyse every newly downloaded track for BPM/key BEFORE the XML is built, so the tags
@@ -908,6 +950,7 @@ def _print_sync_summary(results):
     width = max((len(r["name"]) for r in results), default=12)
     tot_new = sum(r["new"] for r in results)
     tot_removed = sum(r["removed"] for r in results)
+    tot_dead = sum(r.get("dead", 0) for r in results)
     tot_errors = sum(len(r["errors"]) for r in results)
     changed = [r for r in results if r["new"] or r["removed"] or r["errors"]]
 
@@ -917,22 +960,25 @@ def _print_sync_summary(results):
     for r in results:
         if r["status"].startswith("skipped"):
             state = r["status"]
-        elif r["new"] or r["removed"]:
+        else:
             parts = []
             if r["new"]:
                 parts.append(f"+{r['new']} new")
             if r["removed"]:
                 parts.append(f"-{r['removed']} removed")
-            state = ", ".join(parts)
-        else:
-            state = "up to date"
+            if r.get("dead"):
+                parts.append(f"{r['dead']} unavailable")
+            state = ", ".join(parts) if parts else "up to date"
         flag = "⚠️ " if r["errors"] else "  "
         suffix = f"   ({len(r['errors'])} error(s))" if r["errors"] else ""
         print(f" {flag} {r['name']:<{width}}  {state}{suffix}")
     print("-" * 56)
     print(f"{len(changed)} of {len(results)} playlist(s) changed | "
-          f"{tot_new} new, {tot_removed} removed, {tot_errors} error(s)")
+          f"{tot_new} new, {tot_removed} removed, {tot_dead} unavailable, {tot_errors} error(s)")
     print("=" * 56)
+    if tot_dead:
+        print("ℹ️  'unavailable' = tracks Spotify has delisted/region-locked/removed "
+              "(no downloadable audio). Skipped, not an error.")
 
     errored = [r for r in results if r["errors"]]
     if errored:
@@ -1140,7 +1186,7 @@ def _track_ref(track_id):
     return f"https://open.spotify.com/track/{track_id}"
 
 
-def _spotify_incremental_sync(entry, creds, output_path):
+def _spotify_incremental_sync(entry, creds, output_path, result=None):
     """
     Cache-based Spotify sync. Fetch the current tracklist from the Spotify API, diff it
     against the local cache by track id, then: download only NEW tracks (individual spotdl
@@ -1148,14 +1194,45 @@ def _spotify_incremental_sync(entry, creds, output_path):
     cache. This avoids spotdl re-walking the entire playlist (hundreds of API calls) on
     every sync. Returns notable error lines. Per-playlist counts are reported by the caller
     from the on-disk file diff, so this stays quiet apart from spotdl's own download output.
+
+    Dead-track isolation: new tracks are handed to spotdl as ONE batch download. spotdl's
+    get_simple_songs raises SongError on any track with zero duration_ms or an empty name
+    (delisted/region-locked/removed), and that single failure aborts resolution for the
+    ENTIRE batch, so legitimately new tracks silently fail to download. We detect such dead
+    tracks from the Spotify API metadata, drop them from the batch, log each once, and
+    persist them to a per-playlist skip-list (dead_tracks.json) so they are not re-attempted
+    every future sync. `result` (optional) has result["dead"] set to the count of dead tracks
+    currently in the playlist, for the sync summary.
     """
     playlist_id = extract_spotify_id(entry["url"])
     current = fetch_spotify_playlist(entry["url"], creds)
     cache = load_playlist_cache(playlist_id)
 
-    cache_ids = {t["id"] for t in cache}
+    # ── Dead-track isolation (see docstring) ── detect dead tracks in the current playlist,
+    # log any newly discovered ones, and merge them into the persisted skip-list.
+    known_dead = load_dead_tracks(playlist_id)
+    dead_ids = {d["id"] for d in known_dead}
+    newly_dead = []
+    for t in current:
+        if _is_dead_track(t) and t["id"] not in dead_ids:
+            reason = "empty name" if not (t.get("title") or "").strip() else "zero duration"
+            newly_dead.append({"id": t["id"], "title": t.get("title", ""), "reason": reason})
+    if newly_dead:
+        print(f"  ⏭️  Skipping {len(newly_dead)} dead Spotify track(s) "
+              f"(delisted/region-locked/removed - cannot be downloaded):")
+        for d in newly_dead:
+            print(f"       - {d['title'] or '(no title)'}  [{d['id']}]  ({d['reason']})")
+        known_dead = known_dead + newly_dead
+        dead_ids |= {d["id"] for d in newly_dead}
+        save_dead_tracks(playlist_id, known_dead)
     current_ids = {t["id"] for t in current}
-    new_tracks = [t for t in current if t["id"] not in cache_ids]
+    if result is not None:
+        result["dead"] = len(dead_ids & current_ids)
+
+    cache_ids = {t["id"] for t in cache}
+    # New tracks: in the playlist, not yet cached, and NOT on the dead skip-list, so one
+    # dead track can never block the rest of the batch.
+    new_tracks = [t for t in current if t["id"] not in cache_ids and t["id"] not in dead_ids]
     removed_tracks = [t for t in cache if t["id"] not in current_ids]
 
     if not new_tracks and not removed_tracks:
@@ -1251,7 +1328,7 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
     url = entry["url"]
     output_path = os.path.expanduser(entry["output_path"])
     os.makedirs(output_path, exist_ok=True)
-    result = {"name": name, "source": source, "new": 0, "removed": 0,
+    result = {"name": name, "source": source, "new": 0, "removed": 0, "dead": 0,
               "new_paths": [], "errors": [], "status": "ok"}
 
     print(f"\n── {name} [{source}] ──")
@@ -1266,7 +1343,7 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
             result["errors"] = _spotify_full_sync(entry, creds, output_path)
         else:
             try:
-                result["errors"] = _spotify_incremental_sync(entry, creds, output_path)
+                result["errors"] = _spotify_incremental_sync(entry, creds, output_path, result)
             except Exception as e:
                 print(f"  ⚠️  Cache-based sync failed ({e}); falling back to full spotdl sync.")
                 result["errors"] = _spotify_full_sync(entry, creds, output_path)
@@ -1326,6 +1403,8 @@ def sync_one_playlist(entry, creds, sc_token=None, force_full=False):
         bits.append(f"+{result['new']} new")
     if result["removed"]:
         bits.append(f"-{result['removed']} removed")
+    if result.get("dead"):
+        bits.append(f"{result['dead']} unavailable")
     line = ", ".join(bits) if bits else "up to date"
     if result["errors"]:
         line += f"  ⚠️  {len(result['errors'])} error(s)"
