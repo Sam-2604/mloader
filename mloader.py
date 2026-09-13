@@ -11,6 +11,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import base64
+import datetime
 import xml.etree.ElementTree as ET
 import yt_dlp
 
@@ -225,6 +226,32 @@ def check_dependencies():
             print(f"   Install: {install_hint}")
     if missing:
         sys.exit(1)
+    check_youtube_health()
+
+
+# YouTube changes its player/signature scheme every few weeks, so a yt-dlp that worked
+# last month is the single most common cause of "HTTP Error 403: Forbidden". These are
+# warnings, not hard failures - non-YouTube sources keep working regardless.
+YTDLP_STALE_DAYS = 60
+
+
+def check_youtube_health():
+    """Warn about the two conditions that make YouTube downloads fail with HTTP 403."""
+    try:
+        released = datetime.datetime.strptime(yt_dlp.version.__version__[:10], "%Y.%m.%d")
+        age_days = (datetime.datetime.now() - released).days
+        if age_days > YTDLP_STALE_DAYS:
+            print(f"\n⚠️  yt-dlp is {age_days} days old ({yt_dlp.version.__version__}).")
+            print("   YouTube downloads commonly fail with HTTP 403 on outdated versions.")
+            print("   Update: pip install -U yt-dlp")
+    except Exception:
+        pass  # Unparseable version string - not worth blocking the run over
+
+    if not detect_js_runtimes():
+        print("\n⚠️  No JavaScript runtime found (deno, node, bun or quickjs).")
+        print("   yt-dlp needs one to sign YouTube media URLs; without it YouTube")
+        print("   downloads may fail with HTTP 403.")
+        print("   Install: brew install deno  /  brew install node")
 
 
 def check_disk_space(path):
@@ -654,6 +681,20 @@ class YTDLPLogger:
         self.errors.append(msg)
 
 
+# YouTube protects its media URLs with an obfuscated JavaScript challenge (the 'n'
+# parameter). yt-dlp has to run that JS to sign the URL; unsigned URLs come back as
+# HTTP 403. yt-dlp only auto-detects Deno, so on a machine with Node (or Bun/QuickJS)
+# but no Deno it silently falls back to player clients that skip the challenge - and
+# those clients are exactly the ones YouTube blocks first. Passing whatever runtime is
+# actually installed keeps the signing path working.
+JS_RUNTIME_CANDIDATES = ("deno", "node", "bun", "quickjs")
+
+
+def detect_js_runtimes():
+    """Return yt-dlp's js_runtimes dict for whichever JS runtimes exist on this machine."""
+    return {name: {} for name in JS_RUNTIME_CANDIDATES if shutil.which(name)}
+
+
 def download_ytdlp(url, output_path, archive_path=None):
     """
     Download via yt-dlp Python API. Handles YouTube, Bandcamp, Mixcloud, and any other
@@ -681,6 +722,9 @@ def download_ytdlp(url, output_path, archive_path=None):
         'writethumbnail': True,
         'quiet': False,
     }
+    js_runtimes = detect_js_runtimes()
+    if js_runtimes:
+        ydl_opts['js_runtimes'] = js_runtimes
     if archive_path:
         ydl_opts['download_archive'] = archive_path
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
